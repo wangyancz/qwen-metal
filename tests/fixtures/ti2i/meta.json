@@ -1,0 +1,15 @@
+{
+  "side": 256,
+  "grid_hw": [
+    8,
+    8
+  ],
+  "drop": 14,
+  "seq": 85,
+  "slots": 64,
+  "cond_tokens": 256,
+  "target_tokens": 256,
+  "rows": 533,
+  "sigma": 0.9140625,
+  "prompt": "\u628a\u8fd9\u53ea\u732b\u653e\u5230\u96ea\u5730\u91cc"
+}
