@@ -1,0 +1,51 @@
+{
+ "hidden": 4096,
+ "heads": 32,
+ "head_dim": 128,
+ "eps": 1e-06,
+ "sigma": 0.37,
+ "cases": {
+  "a": {
+   "seq": 16,
+   "text_rows": 0,
+   "segments": []
+  },
+  "b": {
+   "seq": 20,
+   "text_rows": 8,
+   "segments": [
+    [
+     0,
+     8,
+     true
+    ]
+   ]
+  },
+  "c": {
+   "seq": 149,
+   "text_rows": 37,
+   "segments": [
+    [
+     0,
+     20,
+     true
+    ],
+    [
+     20,
+     68,
+     false
+    ],
+    [
+     68,
+     85,
+     true
+    ],
+    [
+     85,
+     149,
+     false
+    ]
+   ]
+  }
+ }
+}
