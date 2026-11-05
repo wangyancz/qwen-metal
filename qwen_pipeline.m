@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 
 /* Seeded RNG: splitmix64 warmup + Box-Muller. Exact torch parity is
@@ -56,14 +57,21 @@ static void *pipe_progress_ctx;
  * encode phase of ti2i scales with the reference-image count; these
  * marks locate which section). */
 static int pipe_timing_on = -1;
-/* Set once by qw_pipe_generate_ti2i: lets pipe_mark also report h3 live
- * bytes + phys_footprint per stage (QWEN_SERVE_MEM=1) so a memory climb
- * can be attributed to the request stage that caused it. */
-static h3_gpu *pipe_mark_gpu;
+/* QWEN_STEP_TRACE=1: per-step phase timings + GPU busy delta (diagnostics;
+ * t2i 与 ti2i 共用同一开关). */
+static int pipe_step_trace_on = -1;
+/* Diagnostic switches are opt-in by value: presence-based getenv()!=NULL
+ * used to enable them even with "=0". */
+static int pipe_env_on(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+    return strcmp(v, "0") != 0 && strcasecmp(v, "off") != 0 &&
+           strcasecmp(v, "false") != 0;
+}
 
 static double pipe_now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
@@ -77,24 +85,29 @@ static double pipe_footprint_gb(void) {
 }
 
 static double pipe_timing_t0;
+static double pipe_timing_last;
 
-static void pipe_mark(const char *label) {
+/* gpu is passed explicitly: a cached static h3_gpu * survived engine
+ * teardown and became a dangling pointer in pipe_mark(). */
+static void pipe_mark(h3_gpu *gpu, const char *label) {
     if (pipe_timing_on < 0)
-        pipe_timing_on = getenv("QWEN_TI2I_TIMING") != NULL;
+        pipe_timing_on = pipe_env_on("QWEN_TI2I_TIMING");
     if (!pipe_timing_on) return;
     double now = pipe_now();
-    if (pipe_mark_gpu && getenv("QWEN_SERVE_MEM")) {
+    double total = now - pipe_timing_t0;
+    double delta = now - pipe_timing_last;
+    if (gpu && pipe_env_on("QWEN_SERVE_MEM")) {
         h3_gpu_stats st;
-        h3_gpu_get_stats(pipe_mark_gpu, &st);
+        h3_gpu_get_stats(gpu, &st);
         fprintf(stderr,
                 "[ti2i] %-22s %7.2fs (+%.2fs) live=%.2fGB footprint=%.2fGB\n",
-                label, now - pipe_timing_t0, now - pipe_timing_t0,
-                (double)st.live_bytes / 1e9, pipe_footprint_gb());
+                label, total, delta, (double)st.live_bytes / 1e9,
+                pipe_footprint_gb());
     } else {
         fprintf(stderr, "[ti2i] %-22s %7.2fs (+%.2fs)\n", label,
-                now - pipe_timing_t0, now - pipe_timing_t0);
+                total, delta);
     }
-    pipe_timing_t0 = now;
+    pipe_timing_last = now;
 }
 
 void qw_pipe_set_progress(qw_pipe_progress_fn cb, void *ctx) {
@@ -337,7 +350,21 @@ int qw_pipe_denoise(qw_dit *dit, h3_gpu *gpu, const h3_gpu_tensor *text_in,
         goto done;
     }
 
+    /* QWEN_STEP_TRACE=1：每步分段计时 + GPU busy 差分（诊断用）。
+     * fwd=CPU 侧 forward 墙钟（MPS 提交可与 GPU 执行重叠）；sub=submit
+     * 等待；gpu=h3 统计的 GPU 执行时间；idle=wall−gpu=GPU 空闲池。 */
+    int trace = pipe_step_trace_on < 0
+                    ? (pipe_step_trace_on = pipe_env_on("QWEN_STEP_TRACE"))
+                    : pipe_step_trace_on;
+    h3_gpu_stats tr_st0 = {0}, tr_st1 = {0};
+    double tr_wall = 0, tr_up = 0, tr_fwd = 0, tr_sub = 0, tr_read = 0,
+           tr_host = 0, tr_gpu = 0;
+    uint32_t tr_n = 0;
     for (uint32_t step = 0; ok && step < steps; step++) {
+        double tr_t = trace ? pipe_now() : 0;
+        double tr_p0 = tr_t, tr_p1 = 0, tr_p2 = 0, tr_p3 = 0, tr_p4 = 0,
+               tr_p5 = 0, tr_p6 = 0, tr_p7 = 0;
+        if (trace) h3_gpu_get_stats(gpu, &tr_st0);
         for (size_t i = 0; i < count; i++)
             latent_host[i] = host_bf16(latents[i]);
         if (!h3_gpu_tensor_write_bf16(latent_in, latent_host, count)) {
@@ -345,22 +372,26 @@ int qw_pipe_denoise(qw_dit *dit, h3_gpu *gpu, const h3_gpu_tensor *text_in,
             ok = 0;
             break;
         }
+        if (trace) tr_p0 = pipe_now();
         if (!qw_dit_forward(dit, text_in, text_rows, latent_in, image_rows,
                             (float)sigmas[step], rope_cos, rope_sin, pred,
                             error, error_size)) {
             ok = 0;
             break;
         }
+        if (trace) tr_p1 = pipe_now();
         if (!h3_gpu_submit(gpu) || !h3_gpu_begin(gpu)) {
             snprintf(error, error_size, "%s", h3_gpu_error(gpu));
             ok = 0;
             break;
         }
+        if (trace) tr_p2 = pipe_now();
         if (!h3_gpu_tensor_read_bf16(pred, pred_host, pos_pred_count)) {
             snprintf(error, error_size, "denoise: pred read failed");
             ok = 0;
             break;
         }
+        if (trace) tr_p3 = pipe_now();
         if (guided) {
             if (!qw_dit_forward(dit, neg_text_in, neg_rows, latent_in,
                                 image_rows, (float)sigmas[step], neg_cos,
@@ -368,17 +399,20 @@ int qw_pipe_denoise(qw_dit *dit, h3_gpu *gpu, const h3_gpu_tensor *text_in,
                 ok = 0;
                 break;
             }
+            if (trace) tr_p4 = pipe_now();
             if (!h3_gpu_submit(gpu) || !h3_gpu_begin(gpu)) {
                 snprintf(error, error_size, "%s", h3_gpu_error(gpu));
                 ok = 0;
                 break;
             }
+            if (trace) tr_p5 = pipe_now();
             if (!h3_gpu_tensor_read_bf16(neg_pred, neg_pred_host,
                                          neg_pred_count)) {
                 snprintf(error, error_size, "denoise: neg pred read failed");
                 ok = 0;
                 break;
             }
+            if (trace) tr_p6 = pipe_now();
             for (size_t i = 0; i < count; i++)
                 neg_host[i] = host_from_bf16(neg_pred_host[
                     (size_t)neg_rows * 64 + i]);
@@ -393,8 +427,45 @@ int qw_pipe_denoise(qw_dit *dit, h3_gpu *gpu, const h3_gpu_tensor *text_in,
                              cfg_scale * (prediction - neg_host[i]);
             latents[i] += dt * prediction;
         }
+        if (trace) {
+            tr_p7 = pipe_now();
+            h3_gpu_get_stats(gpu, &tr_st1);
+            double wall = tr_p7 - tr_t;
+            double up = tr_p0 - tr_t;
+            double fwd = (tr_p1 - tr_p0) + (guided ? tr_p4 - tr_p3 : 0);
+            double sub = (tr_p2 - tr_p1) + (guided ? tr_p5 - tr_p4 : 0);
+            double read = (tr_p3 - tr_p2) + (guided ? tr_p6 - tr_p5 : 0);
+            double host = tr_p7 - (guided ? tr_p6 : tr_p3);
+            double gpu_s = tr_st1.gpu_seconds - tr_st0.gpu_seconds;
+            fprintf(stderr,
+                    "[step %u] wall=%.3f up=%.3f fwd=%.3f sub=%.3f "
+                    "read=%.3f host=%.3f | gpu=%.3f idle=%.3f | "
+                    "disp=%llu mpslin=%llu sdpa=%llu blit=%llu\n",
+                    step, wall, up, fwd, sub, read, host, gpu_s,
+                    wall - gpu_s,
+                    (unsigned long long)(tr_st1.direct_dispatches -
+                                         tr_st0.direct_dispatches),
+                    (unsigned long long)(tr_st1.mps_linear_dispatches -
+                                         tr_st0.mps_linear_dispatches),
+                    (unsigned long long)(tr_st1.mps_sdpa_dispatches -
+                                         tr_st0.mps_sdpa_dispatches),
+                    (unsigned long long)(tr_st1.blit_copies -
+                                         tr_st0.blit_copies));
+            if (step > 0) { /* step 0 含图编译，不进均值 */
+                tr_wall += wall; tr_up += up; tr_fwd += fwd; tr_sub += sub;
+                tr_read += read; tr_host += host; tr_gpu += gpu_s; tr_n++;
+            }
+        }
         pipe_progress(step + 1, steps);
     }
+    if (trace && tr_n && tr_wall > 0)
+        fprintf(stderr,
+                "[step-trace] n=%u avg wall=%.3f up=%.3f fwd=%.3f sub=%.3f "
+                "read=%.3f host=%.3f gpu=%.3f idle=%.3f gpu_busy=%.1f%%\n",
+                tr_n, tr_wall / tr_n, tr_up / tr_n, tr_fwd / tr_n,
+                tr_sub / tr_n, tr_read / tr_n, tr_host / tr_n,
+                tr_gpu / tr_n, (tr_wall - tr_gpu) / tr_n,
+                100.0 * tr_gpu / tr_wall);
 
 done:
     h3_gpu_tensor_free(latent_in);
@@ -446,10 +517,23 @@ int qw_pipe_decode(qw_vae *vae, h3_gpu *gpu, const float *latents,
                 latents[(size_t)p * QWEN_VAE_Z + c] * std[c] + mean[c];
     }
     ok = h3_gpu_tensor_write_f32(z, z_host, z_count);
-    ok = ok && qw_vae_decode(vae, z, gh, gw, image, error, error_size);
-    ok = ok && h3_gpu_submit(gpu) && h3_gpu_begin(gpu);
-    ok = ok && h3_gpu_tensor_read_f32(image, frame,
-                                      (size_t)4 * out_w * out_h);
+    if (ok)
+        ok = qw_vae_decode(vae, z, gh, gw, image, error, error_size);
+    /* Always drain: a failed decode must not leave encoded commands
+     * referencing z/image, which are freed at done:. */
+    if (!h3_gpu_submit(gpu)) {
+        if (ok)
+            snprintf(error, error_size, "decode: submit failed: %s",
+                     h3_gpu_error(gpu));
+        ok = 0;
+    } else if (ok && !h3_gpu_begin(gpu)) {
+        snprintf(error, error_size, "decode: begin failed: %s",
+                 h3_gpu_error(gpu));
+        ok = 0;
+    }
+    if (ok)
+        ok = h3_gpu_tensor_read_f32(image, frame,
+                                    (size_t)4 * out_w * out_h);
     if (ok) {
         for (uint32_t y = 0; y < out_h; y++) {
             for (uint32_t x = 0; x < out_w; x++) {
@@ -487,6 +571,14 @@ int qw_pipe_generate(qw_dit *dit, qw_vae *vae, h3_gpu *gpu,
     if (!params || !params->width || !params->height ||
         params->width % 32 || params->height % 32) {
         snprintf(error, error_size, "generate: size must be multiples of 32");
+        return 0;
+    }
+    /* Self-contained API: main.c opens the chain, but an embedder calling
+     * qw_pipe_generate directly must not encode the first DiT forward
+     * into a nil command buffer. */
+    if (!h3_gpu_begin(gpu) && !h3_gpu_continue(gpu)) {
+        snprintf(error, error_size, "generate: GPU chain unavailable: %s",
+                 h3_gpu_error(gpu));
         return 0;
     }
     uint32_t gh = params->height / 16;
@@ -678,6 +770,13 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
                           const double *turbo_sigmas, uint32_t turbo_count,
                           const qw_sched_cfg *sched, uint8_t **rgba_out,
                           char *error, size_t error_size) {
+    /* Several failure paths only report through h3_gpu_error() and never
+     * write `error`; CLI/REPL callers pass an uninitialized buffer, so
+     * start from a clean slate. */
+    if (error && error_size) error[0] = 0;
+    /* cond KV cache reuse matches layout only, never content: drop any
+     * cache left behind by an aborted previous request up front. */
+    qw_dit_ti2i_cache_clear(dit);
     /* Mirror qw_pipe_generate's validation: downstream derives latent
      * rows as width/16 * height/16 and reads back decode output at
      * params width×height, so a non-32-multiple size would make the
@@ -693,13 +792,12 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
      * 才启用；cfg > 1 而无 negative 降回 1（官方同款告警继续）。 */
     int guided = params->cfg_scale > 1.0f && params->negative &&
                  *params->negative;
-    pipe_mark_gpu = gpu; /* stage marks report live/footprint */
     if (params->cfg_scale > 1.0f && !guided)
         fprintf(stderr,
                 "ti2i: cfg %.2f without a negative prompt stays at 1.0\n",
                 params->cfg_scale);
-    pipe_timing_t0 = pipe_now();
-    pipe_mark("begin");
+    pipe_timing_t0 = pipe_timing_last = pipe_now();
+    pipe_mark(gpu, "begin");
     if (!n_images || n_images > QW_TI2I_MAX_IMAGES) {
         snprintf(error, error_size, "ti2i: 1..%d reference images",
                  QW_TI2I_MAX_IMAGES);
@@ -792,19 +890,30 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
             cond_t = h3_gpu_tensor_new_bf16(gpu, (size_t)cond_arr[i] * 64);
             ok = vae_t && cond_t;
         }
-        ok = ok && h3_gpu_tensor_write_f32(vae_t, vae_in,
-                                           4 * (size_t)iw * ih);
-        ok = ok && qw_vae_encode(vae, vae_t, ih, iw, cond_t, error,
-                                 error_size);
-        ok = ok && h3_gpu_submit(gpu);
-        ok = ok && h3_gpu_tensor_read_bf16(cond_t,
-                                           cond_host + cond_off * 64,
-                                           (size_t)cond_arr[i] * 64);
+        if (ok)
+            ok = h3_gpu_tensor_write_f32(vae_t, vae_in,
+                                         4 * (size_t)iw * ih);
+        if (ok)
+            ok = qw_vae_encode(vae, vae_t, ih, iw, cond_t, error,
+                               error_size);
+        /* Unconditional: on a failure above the chain is still open and
+         * references vae_t/cond_t, which are freed just below. */
+        if (!h3_gpu_submit(gpu)) {
+            if (ok)
+                snprintf(error, error_size,
+                         "ti2i: image %u VAE submit failed: %s", i,
+                         h3_gpu_error(gpu));
+            ok = 0;
+        }
+        if (ok)
+            ok = h3_gpu_tensor_read_bf16(cond_t,
+                                         cond_host + cond_off * 64,
+                                         (size_t)cond_arr[i] * 64);
         h3_gpu_tensor_free(vae_t);
         h3_gpu_tensor_free(cond_t);
         free(vae_in);
         cond_off += cond_arr[i];
-        pipe_mark("img N imgproc+vae");
+        pipe_mark(gpu, "img N imgproc+vae");
         if (!ok) {
             char detail[256];
             snprintf(detail, sizeof(detail), "%s",
@@ -818,7 +927,7 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
         free(rgb_arr);
     }
     rgb_arr = NULL;
-    pipe_mark("section1 imgproc+vae");
+    pipe_mark(gpu, "section1 imgproc+vae");
     /* 2. 视觉塔（多图一次前向，图间注意力隔离） */
     float *merged = malloc(sizeof(float) * (size_t)slots_total * 4096);
     float *deepstack =
@@ -846,7 +955,7 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
         ds_bf[i] = pipe_bf16(deepstack[i]);
     free(merged); merged = NULL;
     free(deepstack); deepstack = NULL;
-    pipe_mark("vision(+bf16)");
+    pipe_mark(gpu, "vision(+bf16)");
 
     /* 3. 文本塔 ti2i 组装（多图 grid 数组，merged/ds 按图序拼接） */
     /* 段容量按上界动态分配：byte-level BPE 的 token 数不超过模板字节
@@ -887,13 +996,21 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
     }
     /* encode_core 的命令链在函数内不收尾：提交后才能读 hidden。
      * （序列容量由 encode_ti2i 内部先行校验，此处无需再查。） */
-    pipe_mark("text returned");
-    ok = ok && h3_gpu_submit(gpu);
-    pipe_mark("text final submit");
+    pipe_mark(gpu, "text returned");
+    /* encode_core deliberately leaves the chain open; submit even when
+     * the encode failed so the next request does not inherit encoded
+     * commands that reference freed hidden tensors. */
+    if (!h3_gpu_submit(gpu)) {
+        if (ok)
+            snprintf(error, error_size, "ti2i: text submit failed: %s",
+                     h3_gpu_error(gpu));
+        ok = 0;
+    }
+    pipe_mark(gpu, "text final submit");
     free(grid_hw); grid_hw = NULL;
     free(merged_bf); merged_bf = NULL;
     free(ds_bf); ds_bf = NULL;
-    pipe_mark("text(+submit)");
+    pipe_mark(gpu, "text(+submit)");
 
     /* 4. 段布局（img_mask → 段）：[text0][img0][text1][img1]...[textN]，
      * joint 行序 = segs scatter 序；图像数据 packed 在前（segs 的
@@ -1013,12 +1130,23 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
     uint16_t *neg_pred_host =
         guided ? malloc(sizeof(uint16_t) * (size_t)neg_rows * 64) : NULL;
     ok = ok && pred_host && (!guided || neg_pred_host);
-    pipe_mark("layout(rope+joint)");
+    pipe_mark(gpu, "layout(rope+joint)");
     if (ok) {
         memcpy(joint_host, cond_host,
                sizeof(uint16_t) * (size_t)cond_total * 64);
     }
+    int ti_trace = pipe_step_trace_on < 0
+                       ? (pipe_step_trace_on = pipe_env_on("QWEN_STEP_TRACE"))
+                       : pipe_step_trace_on;
+    h3_gpu_stats ti_st0 = {0}, ti_st1 = {0};
+    double ti_wall = 0, ti_up = 0, ti_fwd = 0, ti_sub = 0, ti_read = 0,
+           ti_host = 0, ti_gpu = 0;
+    uint32_t ti_n = 0;
     for (uint32_t step = 0; ok && step < params->steps; step++) {
+        double ti_t = ti_trace ? pipe_now() : 0;
+        double ti_p0 = ti_t, ti_p1 = 0, ti_p2 = 0, ti_p3 = 0, ti_p4 = 0,
+               ti_p5 = 0, ti_p6 = 0, ti_p7 = 0;
+        if (ti_trace) h3_gpu_get_stats(gpu, &ti_st0);
         double sigma = sigmas[step], next = sigmas[step + 1];
         /* packed latent 布局：各图 cond 在前、target 紧随（segs 的
          * src_offset 语义）。文本段的行保持零（由 scatter 覆盖）。 */
@@ -1032,6 +1160,7 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
             ok = 0;
             break;
         }
+        if (ti_trace) ti_p0 = pipe_now();
         if (!h3_gpu_begin(gpu) && !h3_gpu_continue(gpu)) {
             snprintf(error, error_size, "ti2i: step begin failed");
             ok = 0;
@@ -1043,27 +1172,45 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
             ok = 0;
             break;
         }
+        if (ti_trace) ti_p1 = pipe_now();
         if (!h3_gpu_submit(gpu)) {
+            snprintf(error, error_size,
+                     "ti2i: step submit failed: %s",
+                     h3_gpu_error(gpu));
             ok = 0;
             break;
         }
+        if (ti_trace) ti_p2 = pipe_now();
         if (!h3_gpu_tensor_read_bf16(pred, pred_host,
                                      (size_t)rows * 64)) {
             ok = 0;
             break;
         }
+        if (ti_trace) ti_p3 = pipe_now();
         /* CFG 负向分支：同 target latents、独立文本/K-V 缓存（slot 1）。 */
         if (guided) {
             if (!qw_dit_forward_ti2i(dit, neg_hidden, neg_joint, neg_segs,
                                      n_seg, 1, neg_rope_cos, neg_rope_sin,
                                      (float)sigma, neg_pred, error,
-                                     error_size) ||
-                !h3_gpu_submit(gpu) ||
-                !h3_gpu_tensor_read_bf16(neg_pred, neg_pred_host,
+                                     error_size)) {
+                ok = 0;
+                break;
+            }
+            if (ti_trace) ti_p4 = pipe_now();
+            if (!h3_gpu_submit(gpu)) {
+                snprintf(error, error_size,
+                         "ti2i: step submit failed: %s",
+                         h3_gpu_error(gpu));
+                ok = 0;
+                break;
+            }
+            if (ti_trace) ti_p5 = pipe_now();
+            if (!h3_gpu_tensor_read_bf16(neg_pred, neg_pred_host,
                                          (size_t)neg_rows * 64)) {
                 ok = 0;
                 break;
             }
+            if (ti_trace) ti_p6 = pipe_now();
         }
         size_t base = (size_t)rows - target_tokens;
         size_t neg_base =
@@ -1086,10 +1233,48 @@ int qw_pipe_generate_ti2i(qw_dit *dit, qw_vae *vae, struct qw_text *text,
         if (pipe_timing_on) {
             char label[32];
             snprintf(label, sizeof(label), "step %u", step);
-            pipe_mark(label);
+            pipe_mark(gpu, label);
+        }
+        if (ti_trace) {
+            ti_p7 = pipe_now();
+            h3_gpu_get_stats(gpu, &ti_st1);
+            double wall = ti_p7 - ti_t;
+            double up = ti_p0 - ti_t;
+            double fwd = (ti_p1 - ti_p0) + (guided ? ti_p4 - ti_p3 : 0);
+            double sub = (ti_p2 - ti_p1) + (guided ? ti_p5 - ti_p4 : 0);
+            double read = (ti_p3 - ti_p2) + (guided ? ti_p6 - ti_p5 : 0);
+            double host = ti_p7 - (guided ? ti_p6 : ti_p3);
+            double gpu_s = ti_st1.gpu_seconds - ti_st0.gpu_seconds;
+            fprintf(stderr,
+                    "[ti2i step %u] wall=%.3f up=%.3f fwd=%.3f sub=%.3f "
+                    "read=%.3f host=%.3f | gpu=%.3f idle=%.3f | "
+                    "disp=%llu mpslin=%llu sdpa=%llu blit=%llu\n",
+                    step, wall, up, fwd, sub, read, host, gpu_s,
+                    wall - gpu_s,
+                    (unsigned long long)(ti_st1.direct_dispatches -
+                                         ti_st0.direct_dispatches),
+                    (unsigned long long)(ti_st1.mps_linear_dispatches -
+                                         ti_st0.mps_linear_dispatches),
+                    (unsigned long long)(ti_st1.mps_sdpa_dispatches -
+                                         ti_st0.mps_sdpa_dispatches),
+                    (unsigned long long)(ti_st1.blit_copies -
+                                         ti_st0.blit_copies));
+            if (step > 0) { /* step 0 含图编译，不进均值 */
+                ti_wall += wall; ti_up += up; ti_fwd += fwd; ti_sub += sub;
+                ti_read += read; ti_host += host; ti_gpu += gpu_s; ti_n++;
+            }
         }
         pipe_progress(step + 1, params->steps);
     }
+    if (ti_trace && ti_n && ti_wall > 0)
+        fprintf(stderr,
+                "[ti2i step-trace] n=%u avg wall=%.3f up=%.3f fwd=%.3f "
+                "sub=%.3f read=%.3f host=%.3f gpu=%.3f idle=%.3f "
+                "gpu_busy=%.1f%%\n",
+                ti_n, ti_wall / ti_n, ti_up / ti_n, ti_fwd / ti_n,
+                ti_sub / ti_n, ti_read / ti_n, ti_host / ti_n,
+                ti_gpu / ti_n, (ti_wall - ti_gpu) / ti_n,
+                100.0 * ti_gpu / ti_wall);
     free(joint_host); joint_host = NULL;
     free(pred_host); pred_host = NULL;
     free(neg_pred_host); neg_pred_host = NULL;

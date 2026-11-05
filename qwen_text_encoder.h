@@ -72,7 +72,7 @@ int qw_text_template_tokens_ti2i(qw_text *text, const char *prompt,
 /* get_rope_index（单 batch、无 padding、N 图）：文本段三轴共用递增位置；
  * image_pad 连续段用 T=start、H=start+row、W=start+col 的 merged 网格
  * 行主序展开；位置推进 max(gh, gw)。pos_out [3, count]（T/H/W 三行）。 */
-void qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
+int qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
                      uint32_t n_images, const uint32_t *grid_hw,
                      int32_t *pos_out);
 

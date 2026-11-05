@@ -386,6 +386,23 @@ static uint64_t h3_u64_le(const unsigned char bytes[8]) {
     return value;
 }
 
+/* pread() may be interrupted by a signal (the serve heartbeat thread /
+ * terminal SIGWINCH) or return a short read on a slow volume. Retry and
+ * accumulate so a transient EINTR is not misreported as a corrupt file. */
+static ssize_t h3_st_pread_full(int fd, void *buf, size_t len, off_t off) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n;
+        do {
+            n = pread(fd, (char *)buf + done, len - done,
+                      off + (off_t)done);
+        } while (n < 0 && errno == EINTR);
+        if (n <= 0) return -1;
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
+}
+
 int h3_st_read_header(const char *path, h3_st_header *header,
                       char *error, size_t error_size) {
     if (!path || !header) return 0;
@@ -399,7 +416,7 @@ int h3_st_read_header(const char *path, h3_st_header *header,
     struct stat status;
     unsigned char prefix[8];
     if (fstat(descriptor, &status) != 0 || status.st_size < 8 ||
-        pread(descriptor, prefix, sizeof(prefix), 0) != (ssize_t)sizeof(prefix)) {
+        h3_st_pread_full(descriptor, prefix, sizeof(prefix), 0) < 0) {
         if (error && error_size) snprintf(error, error_size, "%s: invalid file", path);
         close(descriptor);
         return 0;
@@ -412,7 +429,8 @@ int h3_st_read_header(const char *path, h3_st_header *header,
         return 0;
     }
     char *json = malloc((size_t)header_size + 1);
-    if (!json || pread(descriptor, json, (size_t)header_size, 8) != (ssize_t)header_size) {
+    if (!json ||
+        h3_st_pread_full(descriptor, json, (size_t)header_size, 8) < 0) {
         if (error && error_size) snprintf(error, error_size, "%s: cannot read header", path);
         free(json);
         close(descriptor);

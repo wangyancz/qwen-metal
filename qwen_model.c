@@ -44,8 +44,33 @@ static char *read_file_text(const char *path, char *error, size_t error_size) {
         if (error && error_size) snprintf(error, error_size, "short read %s", path);
         return NULL;
     }
+    /* An embedded NUL makes qw_json_parse silently ignore everything
+     * after it (the parser uses C-string termination). */
+    if (memchr(text, '\0', (size_t)size)) {
+        free(text);
+        if (error && error_size)
+            snprintf(error, error_size, "NUL byte in %s", path);
+        return NULL;
+    }
     text[size] = '\0';
     return text;
+}
+
+/* Config numbers are untrusted finite doubles: casting 1e300 / -1 to int
+ * is undefined behaviour, and a negative vocab_size becomes a huge
+ * size_t. Clamp every geometry field before the cast. */
+static int json_int(const qw_json *value, const char *key, double fallback,
+                    int lo, int hi) {
+    double d = qw_json_get_number(value, key, fallback);
+    if (!(d >= (double)lo && d <= (double)hi)) return (int)fallback;
+    return (int)d;
+}
+
+static size_t json_size(const qw_json *value, const char *key,
+                        double fallback, size_t hi) {
+    double d = qw_json_get_number(value, key, fallback);
+    if (!(d >= 1.0 && d <= (double)hi)) return (size_t)fallback;
+    return (size_t)d;
 }
 
 static int parse_config_file(const char *path, qw_json **out, char *error,
@@ -114,14 +139,14 @@ int qw_model_scan(const char *root, qw_model_config *config, char *error,
     snprintf(path, sizeof(path), "%s/transformer/config.json", root);
     qw_json *transformer = NULL;
     if (!parse_config_file(path, &transformer, error, error_size)) return 0;
-    config->dit_layers = (int)qw_json_get_number(transformer, "num_layers", 32);
-    config->dit_heads = (int)qw_json_get_number(transformer, "num_attention_heads", 32);
-    config->dit_head_dim = (int)qw_json_get_number(transformer, "attention_head_dim", 128);
-    config->dit_in_channels = (int)qw_json_get_number(transformer, "in_channels", 64);
-    config->dit_out_channels = (int)qw_json_get_number(transformer, "out_channels", 64);
-    config->dit_context_dim = (int)qw_json_get_number(transformer, "context_in_dim", 4096);
-    config->dit_mlp_ratio = (int)qw_json_get_number(transformer, "mlp_ratio", 3);
-    config->dit_patch_size = (int)qw_json_get_number(transformer, "patch_size", 1);
+    config->dit_layers = json_int(transformer, "num_layers", 32, 1, 1048576);
+    config->dit_heads = json_int(transformer, "num_attention_heads", 32, 1, 1048576);
+    config->dit_head_dim = json_int(transformer, "attention_head_dim", 128, 1, 1048576);
+    config->dit_in_channels = json_int(transformer, "in_channels", 64, 1, 1048576);
+    config->dit_out_channels = json_int(transformer, "out_channels", 64, 1, 1048576);
+    config->dit_context_dim = json_int(transformer, "context_in_dim", 4096, 1, 1048576);
+    config->dit_mlp_ratio = json_int(transformer, "mlp_ratio", 3, 1, 1048576);
+    config->dit_patch_size = json_int(transformer, "patch_size", 1, 1, 1048576);
     config->dit_eps = qw_json_get_number(transformer, "eps", 1e-6);
     config->causal_condition = qw_json_get_bool(transformer, "causal_condition", 1);
     {
@@ -142,15 +167,15 @@ int qw_model_scan(const char *root, qw_model_config *config, char *error,
         snprintf(error, error_size, "text_encoder config lacks text_config");
         return 0;
     }
-    config->text_layers = (int)qw_json_get_number(text_config, "num_hidden_layers", 36);
-    config->text_hidden = (int)qw_json_get_number(text_config, "hidden_size", 4096);
-    config->text_mlp = (int)qw_json_get_number(text_config, "intermediate_size", 12288);
-    config->text_heads = (int)qw_json_get_number(text_config, "num_attention_heads", 32);
-    config->text_kv_heads = (int)qw_json_get_number(text_config, "num_key_value_heads", 8);
-    config->text_head_dim = (int)qw_json_get_number(text_config, "head_dim", 128);
+    config->text_layers = json_int(text_config, "num_hidden_layers", 36, 1, 1048576);
+    config->text_hidden = json_int(text_config, "hidden_size", 4096, 1, 1048576);
+    config->text_mlp = json_int(text_config, "intermediate_size", 12288, 1, 1048576);
+    config->text_heads = json_int(text_config, "num_attention_heads", 32, 1, 1048576);
+    config->text_kv_heads = json_int(text_config, "num_key_value_heads", 8, 1, 1048576);
+    config->text_head_dim = json_int(text_config, "head_dim", 128, 1, 1048576);
     config->text_rope_theta = qw_json_get_number(text_config, "rope_theta", 5000000.0);
     config->text_rms_eps = qw_json_get_number(text_config, "rms_norm_eps", 1e-6);
-    config->text_vocab = (size_t)qw_json_get_number(text_config, "vocab_size", 151936);
+    config->text_vocab = json_size(text_config, "vocab_size", 151936, 10000000);
     {
         const qw_json *scaling = qw_json_get(text_config, "rope_scaling");
         const qw_json *section = qw_json_get(scaling, "mrope_section");
@@ -164,14 +189,14 @@ int qw_model_scan(const char *root, qw_model_config *config, char *error,
     snprintf(path, sizeof(path), "%s/vae/config.json", root);
     qw_json *vae = NULL;
     if (!parse_config_file(path, &vae, error, error_size)) return 0;
-    config->vae_z_dim = (int)qw_json_get_number(vae, "z_dim", 64);
-    config->vae_in_channels = (int)qw_json_get_number(vae, "in_channels", 4);
-    config->vae_out_channels = (int)qw_json_get_number(vae, "out_channels", 4);
-    config->vae_base_dim = (int)qw_json_get_number(vae, "base_dim", 96);
-    config->vae_decoder_base_dim = (int)qw_json_get_number(vae, "decoder_base_dim", 144);
-    config->vae_num_res_blocks = (int)qw_json_get_number(vae, "num_res_blocks", 2);
-    config->vae_scale_spatial = (int)qw_json_get_number(vae, "scale_factor_spatial", 16);
-    config->vae_scale_temporal = (int)qw_json_get_number(vae, "scale_factor_temporal", 8);
+    config->vae_z_dim = json_int(vae, "z_dim", 64, 1, 1048576);
+    config->vae_in_channels = json_int(vae, "in_channels", 4, 1, 1048576);
+    config->vae_out_channels = json_int(vae, "out_channels", 4, 1, 1048576);
+    config->vae_base_dim = json_int(vae, "base_dim", 96, 1, 1048576);
+    config->vae_decoder_base_dim = json_int(vae, "decoder_base_dim", 144, 1, 1048576);
+    config->vae_num_res_blocks = json_int(vae, "num_res_blocks", 2, 1, 1048576);
+    config->vae_scale_spatial = json_int(vae, "scale_factor_spatial", 16, 1, 1048576);
+    config->vae_scale_temporal = json_int(vae, "scale_factor_temporal", 8, 1, 1048576);
     config->vae_dim_mult_count =
         json_int_array(qw_json_get(vae, "dim_mult"), config->vae_dim_mult, 8);
     config->vae_temperal_count = json_int_array(
@@ -203,8 +228,8 @@ int qw_model_scan(const char *root, qw_model_config *config, char *error,
     config->sched_base_shift = qw_json_get_number(scheduler, "base_shift", 0.5);
     config->sched_max_shift = qw_json_get_number(scheduler, "max_shift", 0.9);
     config->sched_shift_terminal = qw_json_get_number(scheduler, "shift_terminal", 0.02);
-    config->sched_base_seq = (int)qw_json_get_number(scheduler, "base_image_seq_len", 256);
-    config->sched_max_seq = (int)qw_json_get_number(scheduler, "max_image_seq_len", 8192);
+    config->sched_base_seq = json_int(scheduler, "base_image_seq_len", 256, 1, 1048576);
+    config->sched_max_seq = json_int(scheduler, "max_image_seq_len", 8192, 1, 1048576);
     config->sched_dynamic_shifting = qw_json_get_bool(scheduler, "use_dynamic_shifting", 1);
     qw_json_free(scheduler);
 

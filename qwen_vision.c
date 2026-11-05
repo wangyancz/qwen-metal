@@ -118,29 +118,40 @@ static float *load_named(const char *dir, const char *name, size_t elements,
                          char *error, size_t error_size) {
     char path[1024];
     h3_st_header header;
-    /* base 的 text_encoder 是 4 分片，turbo 是单文件——依次尝试。 */
+    memset(&header, 0, sizeof(header));
+    /* base 的 text_encoder 是 4 分片，turbo 是单文件。权重可能不在这
+     * 一组里的第一个文件，所以「找张量」必须在文件循环内完成，否则
+     * 命中了第一个能读 header 的文件就再也看不到其它分片。 */
     static const char *files[] = {
         "model-00001-of-00004.safetensors",
+        "model-00002-of-00004.safetensors",
+        "model-00003-of-00004.safetensors",
+        "model-00004-of-00004.safetensors",
         "model.safetensors",
     };
-    int opened = 0;
+    const h3_st_tensor *t = NULL;
+    int any_header = 0;
     for (size_t fi = 0; fi < sizeof(files) / sizeof(files[0]); fi++) {
         snprintf(path, sizeof(path), "%s/%s", dir, files[fi]);
         char probe[256];
-        if (h3_st_read_header(path, &header, probe, sizeof(probe))) {
-            opened = 1;
+        h3_st_header candidate;
+        if (!h3_st_read_header(path, &candidate, probe, sizeof(probe)))
+            continue;
+        any_header = 1;
+        const h3_st_tensor *found = h3_st_find(&candidate, name);
+        if (found && h3_st_tensor_elements(found) == elements &&
+            found->dtype == H3_DTYPE_BF16) {
+            header = candidate; /* ownership transferred */
+            t = found;
             break;
         }
+        h3_st_free_header(&candidate);
     }
-    if (!opened) {
-        snprintf(error, error_size, "vision: no safetensors under %s", dir);
-        return NULL;
-    }
-    const h3_st_tensor *t = h3_st_find(&header, name);
-    if (!t || h3_st_tensor_elements(t) != elements ||
-        t->dtype != H3_DTYPE_BF16) {
-        snprintf(error, error_size, "vision weight %s missing/mismatch", name);
-        h3_st_free_header(&header);
+    if (!t) {
+        snprintf(error, error_size,
+                 any_header ? "vision weight %s missing/mismatch"
+                            : "vision: no safetensors under %s",
+                 any_header ? name : dir);
         return NULL;
     }
     float *out = bf16_to_f32(&header, t);
@@ -1097,6 +1108,9 @@ int qw_vision_forward(qw_vision *v, const float *hidden,
         snprintf(error, error_size, "vision forward: bad arguments");
         return 0;
     }
+    /* Some GPU failure paths only set h3_gpu_error(); callers may pass an
+     * uninitialized error buffer, so start from a clean slate. */
+    if (error && error_size) error[0] = 0;
     if (v->use_gpu)
         return vision_forward_gpu(v, hidden, grid_thw, n_images, merged,
                                   deepstack, error, error_size);

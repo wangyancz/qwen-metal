@@ -1,5 +1,7 @@
 # qwen-metal
 
+[English](README.md) | 简体中文
+
 原生 **Qwen-Image-2.1** 文生图推理引擎，面向 Apple Silicon（Metal）。
 
 纯 C11 + Objective-C 实现，零 Python 运行时依赖：文本编码器（Qwen3-VL 文本塔）、
@@ -30,7 +32,7 @@ qwen generate -d /path/to/Qwen-Image-2.1.models \
 | 芯片 | Apple Silicon（M5 Max 开发验证；TensorOps 路径需 M5，其余芯片自动回退普通内核） |
 | 系统 | macOS（需 Metal / MPSGraph 运行时） |
 | 工具链 | Xcode 命令行工具（clang + ObjC + Metal 框架）、zlib（系统自带） |
-| 统一内存 | **16 GB 起**（1024² 峰值约 17 GB）；官方全尺寸档峰值 ≤ 47 GB，64 GB 充裕 |
+| 统一内存 | **建议 32 GB 起**（1024² 峰值约 17 GB、512² 约 10 GB）；官方全尺寸档峰值 ≤ 47 GB，64 GB 充裕 |
 | 磁盘 | 模型权重 31 GB（base）/ 30 GB（turbo） |
 
 ## 模型准备
@@ -72,7 +74,13 @@ make clean && make     # 全量构建，约 2 秒
 | `make text-tests` | 文本编码器分词 + 36 层 hidden | 是 |
 | `make vae-tests` | VAE ~50 个分段比对 | 是 |
 | `make lora-tests` | LoRA 融合数值对拍 + 挂载/摘除生命周期 | 是 + LoRA 文件 |
-| `make dit-fixture` 等 | 重新生成等价性 fixture | 是 + diffusers 环境 |
+| `make prefix-kernel-test` | prefix SDPA 内核 vs CPU 参考 | 是 |
+| `make vae-conv-ci-tests` | VAE 卷积各通道形状恒等权重对拍 | 是 |
+| `make png-tests` / `make vision-tests` / `make imgproc-tests` | PNG 加固 / 视觉塔 / 图像预处理 | 否 / 是 / 否 |
+| `make ti2ifixture-tests` | ti2i 七项离线 fixture 对拍（模板 / vision / text / cond / DiT pred） | 是 |
+| `make vlm-tests` / `make ti2itext-tests` | VLM 文本塔 / ti2i 文本 + DiT 迷你链路 | 是 |
+| `make bench-linear` / `make bench-sdpa` | 线性层 / SDPA 微基准（优化取舍用） | 是 |
+| `make *-fixture`（dit / text / vae / vision / imgproc / vlm / ti2i / pipeline） | 重新生成等价性 fixture | 是 + diffusers 环境 |
 | `make clean` | 清理产物 | — |
 
 不依赖模型权重的快速验证：
@@ -101,7 +109,7 @@ qwen generate -d MODEL_DIR -p "提示词" [选项]
 | `--negative TEXT` | 反向提示词（配合 `--cfg > 1`） | — |
 | `--width N` / `--height N` | 输出尺寸（32 的倍数，[32, 8192]） | 1024 × 1024 |
 | `--steps N` | 去噪步数（[1, 1000]；turbo 自动取 8） | base 40 |
-| `--seed N` | 随机种子（同种子可复现） | 0 |
+| `--seed N` | 随机种子（0 也是有效种子；同种子可复现） | 未指定时取 `time(NULL)` |
 | `--cfg F` | 引导强度（>1 启用 CFG） | 1.0 |
 | `--lora PATH` | LoRA 适配器（safetensors，可重复叠加 ≤8，见下节） | — |
 | `--lora-scale F` | 第 i 个 `--lora` 的强度（可重复按序配对；缺省 1.0，不钳制） | 1.0 |
@@ -404,9 +412,28 @@ live/footprint 报告）：
   `QWEN_BLOCK_PROFILE=1`（分段强制 submit 同步，诊断用）实测 input 段
   17.8→12.7 ms/层（编码税 -0.16 s/步），40 步整图 77.8→73.2 s（GPU
   热态下测得，收益为下界）；融合输出与三 GEMM 版**逐位一致**。经
-  测量 gate+LN 融合仅 ~0.2 ms/层，数据不支持，未做；剩余 CPU 编码
-  税（每层 ~5 次 MPSGraph encode × ~2-3 ms）与 GPU 执行部分重叠，
-  进一步压缩需整步 GPU timeline 捕获定位，挂起。
+  测量 gate+LN 融合仅 ~0.2 ms/层，数据不支持，未做。**CPU 编码税
+  诊断结论（2026-11-04，`QWEN_STEP_TRACE=1` 每步分段 + GPU busy 差分 +
+  `QWEN_ENCODE_DELAY_MS` 每层人工延迟边际响应实验）**：1024² 单步
+  wall ~1.42 s 中 GPU 工作量 ~1.38 s（block profile 分解：mlp+gate
+  ~23.3 ms/层、input ~8.8、attention ~7.6、to_out ~3.1、LN1 ~0.3），
+  **GPU 忙闲率 ~97%，编码税对墙钟的贡献≈0**——纯 CPU 编码仅
+  ~0.1-0.15 s/步（每层 +20 ms 人工延迟墙钟零响应；+100 ms 时 GPU 在
+  CPU 编码期间即完工），基线 fwd 墙钟 ~0.65 s 的大头是 encode 被命令
+  队列反压阻塞的等待。整步 MPSGraph 图捕获在 GPU 饱和前提下无收益，
+  **该项关闭**。`QWEN_MLP_UNFUSED=1` 拆融合 MLP 图 A/B 实测零收益
+  （bench_linear 的 64 TFLOPS 含权重复跑 L2 虚高，融合图实际已贴真实
+  GEMM 天花板）。剩余可挤空间 ~5-8%：attention 生产链 36.6 TFLOPS
+  vs 微基准 47-54（tile 调优）、逐元素内核带宽。诊断基建保留
+  （2026-11-05 评审后统一为「按值启用、创建 DiT 时解析
+  一次」；设 `0` / `off` / `false` 与未设等价，未启用时热路径不做
+  `getenv`）：`QWEN_STEP_TRACE`（每步 up/fwd/sub/read 分段 + h3 GPU
+  busy 差分）、`QWEN_ENCODE_DELAY_MS`（每层 CPU 延迟，0..999 ms，
+  越界钳制、非法值拒绝）、`QWEN_MLP_UNFUSED`（拆融合 MLP A/B，
+  full pass 与 ti2i target-only 两条路径均生效）、`QWEN_BLOCK_PROFILE`
+  （分段计时）、`QWEN_DIT_DUMP`（中间张量转储）与
+  `QWEN_NO_STEP_CACHE` / `QWEN_FLASH_ATTN` / `QWEN_NO_PREFIX`
+  （生产回退开关）。
 - ti2i cond KV cache（2026-10-30）：cond/text 行的输入跨采样步不变
   （embed 固定、modulation 挂 t=0 槽、rope 固定），第一步全量跑并把
   每层 K/V 写入跨步保活的缓冲（`dit->cache_k/v`，单图 +4.3 GB、
@@ -436,6 +463,8 @@ make dit-tests        # DiT：单块逐段 + 32 层全 forward
 make text-tests       # 文本编码器：分词逐位 + 36 层 hidden
 make vae-tests        # VAE：~50 个分段逐位/噪声带
 make pipeline-tests   # 调度器/RoPE/RNG 组件
+make prefix-kernel-test vae-conv-ci-tests
+make png-tests vision-tests imgproc-tests ti2ifixture-tests lora-tests
 ```
 
 - DiT / 文本编码器 / VAE 的 fixture 需要
@@ -452,17 +481,21 @@ make pipeline-tests   # 调度器/RoPE/RNG 组件
 
 ```
 qwen-metal/
-├── h3_gpu.{h,m}          # Metal 运行时（内核调度、MPSGraph、缓存）
+├── h3_gpu.{h,m}          # Metal 运行时（内核调度、MPSGraph、形状缓存）
 ├── h3_shaders.metal      # 全部 Metal 内核（GEMM/注意力/RoPE/卷积/…）
-├── h3_weights.*          # safetensors 流式加载（shard 索引）
+├── h3_weights.*          # safetensors 流式加载（shard 索引、零拷贝映射）
 ├── qwen_host.*           # 架构常量与宿主数学
+├── qwen_model.*          # 检查点扫描与组件配置（含 scheduler 配置）
+├── qwen_json.*           # 轻量 JSON 解析（含递归深度上限）
 ├── qwen_text_encoder.*   # Qwen3-VL 文本塔（36 层，mrope，pre-final-norm）
-├── qwen_dit.*            # 7B 单流 DiT（32 层，块级因果注意力）
-├── qwen_vae.*            # VAE 解码器（Wan 血统，图像路径 = 纯 2D 网络）
+├── qwen_vision.*         # 视觉塔（ti2i 参考图编码，GPU bf16 / CPU 回退）
+├── qwen_imgproc.*        # 参考图缩放、patchify 与 VAE 输入构造
+├── qwen_dit.*            # 7B 单流 DiT（32 层，块级因果注意力、LoRA、cond KV cache）
+├── qwen_vae.*            # VAE 编解码器（Wan 血统，图像路径 = 纯 2D 网络）
 ├── qwen_pipeline.*       # 调度器/RoPE 表/去噪循环/CFG/解码
-├── qwen_png.*            # 极简 PNG 编码器
-├── main.c                # CLI
-└── tests/                # 逐段等价性测试与 fixture 生成器
+├── qwen_png.*            # PNG 编解码（含 CRC/尺寸校验）
+├── main.c                # CLI / REPL / JSONL serve
+└── tests/                # 逐段等价性测试、微基准与 fixture 生成器
 ```
 
 精度要点（与官方 diffusers 参考实现对齐的语义细节）：
@@ -476,10 +509,25 @@ qwen-metal/
 
 ## 调试环境变量
 
+诊断开关（DiT 创建时解析一次）统一为**按值启用**：未设置、空值、`0`、
+`off`、`false` 均为关闭，未启用时热路径不做 `getenv`。生产回退与诊断变量：
+
 | 变量 | 作用 |
 |---|---|
-| `QWEN_TEXT_DUMP=<dir>` | 逐段 dump 文本编码器中间量（等价性排查） |
-| `QWEN_VAE_DUMP=<dir>` | 逐段 dump VAE 中间量 |
+| `QWEN_FLASH_ATTN=1` | 注意力回退自研 flash2 内核（默认 MPSGraph fused SDPA） |
+| `QWEN_NO_STEP_CACHE=1` | 关闭 ti2i cond KV cache，回退每步全量重算 |
+| `QWEN_NO_PREFIX=1` | 强制单 prefix 内核覆盖全部行（诊断模式，自动禁用 cond KV cache） |
+| `QWEN_STEP_TRACE=1` | 每步 up/fwd/sub/read 分段计时 + h3 GPU busy 差分 |
+| `QWEN_ENCODE_DELAY_MS=N` | 每层人工 CPU 编码延迟（0..999 ms，越界钳制、非法值拒绝），用于编码税边际实验 |
+| `QWEN_MLP_UNFUSED=1` | 拆开融合 MLP 图做 A/B（full pass 与 ti2i target-only 两条路径都生效） |
+| `QWEN_BLOCK_PROFILE=1` | DiT 块内分段计时（input / attention / mlp+gate 等） |
+| `QWEN_DIT_DUMP=<dir>` | dump DiT 中间张量（需目录存在） |
+| `QWEN_TEXT_DUMP=<dir>` / `QW_DUMP_POS=1` | 文本编码器逐段 dump / 位置 id dump |
+| `QWEN_VAE_DUMP=<dir>` | VAE 逐阶段激活 dump（GPU 路径自动 submit/read） |
+| `QWEN_VISION_CPU=1` | 视觉塔回退 CPU fp32 路径（默认 GPU bf16） |
+| `QWEN_SERVE_MEM=1` | serve 每请求在 stderr 打印 live/footprint 内存行 |
+| `H3_ZERO_COPY_WEIGHTS=0` / `=transformer` | 关闭权重零拷贝映射 / 仅映射 DiT |
+| `H3_VAE_SCALAR_CONV=1` | VAE 3×3 卷积回退旧标量内核（默认 9-tap GEMM） |
 | `H3_DISABLE_MPS_LINEAR=1` | 禁用 linear 的 MPSGraph 快路（纯内核路径） |
 | `H3_NAX=0` | 禁用 M5 TensorOps |
 
@@ -487,7 +535,18 @@ qwen-metal/
 
 - ti2i 的 CFG 双分支各持一套跨步 K/V 缓存（cfg > 1 时 cond/neg 各一份，
   请求内峰值约翻倍；缓存为单请求生命周期，请求结束释放）
-- Windows / Linux 不支持（深度依赖 Metal）
+- CLI 不校验 `<imageN>` 词面是否超出已传入的参考图数量（官方管线同款透传；
+  Web 前端有校验）——越界编号多半被模型忽略
+- VAE 解码未做 tiling，整图一次解码：权重零拷贝后 1024² 约 17 GB、
+  官方极致档 3264 × 2176 约 47 GB；**最坏组合（1536 × 2752 + ti2i 3 图 +
+  LoRA）footprint ~50 GB、瞬时张量峰值 ~68 GB**，128 GB 机器无压力，
+  64 GB 机器在该组合下吃紧（常规 1024² 会话无碍）
+- MPS rows=1 GEMM 存在运行间 1-ulp 非确定性：同 seed 两次生成的像素差
+  在 ~0.08/255 量级（bf16 舍入序差异），非回归；官方对拍按噪声带判定
+- 整步 MPSGraph 图捕获已通过编码税诊断关闭（GPU 忙闲率 ~97%，无收益空间）；
+  attention tile 调优与逐元素内核带宽是仅剩的 ~5-8% 优化余地
+- Windows / Linux 不支持（深度依赖 Metal）；非 git 仓库，vendored
+  `linenoise.c` 有 30 条历史遗留编译警告（自研代码零警告）
 
 ## 致谢与许可
 

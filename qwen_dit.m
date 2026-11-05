@@ -4,16 +4,78 @@
 #include "qwen_gpu_ext.h"
 
 #include <Accelerate/Accelerate.h>
+#include <errno.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
+#include <unistd.h>
 
 #define QWEN_DIT_MLP (QWEN_HIDDEN * QWEN_MLP_RATIO)
 #define QWEN_DIT_SLOTS 4
 #define QWEN_DIT_ATTENTION_SCALE (1.0f / sqrtf((float)QWEN_HEAD_DIM))
+
+/* Diagnostics / back-off switches are parsed ONCE at qw_dit_create().
+ * Reading getenv() on every layer of every step was measurable on the hot
+ * path, and a presence-based `getenv(...) != NULL` test also treated
+ * "QWEN_MLP_UNFUSED=0" as enabled. Opt-in is by value now: unset, empty,
+ * "0", "off" and "false" all leave the production path untouched. */
+typedef struct {
+    int block_profile;
+    int mlp_unfused;
+    int no_step_cache;
+    int flash_attn;
+    int no_prefix;
+    int dit_dump;
+    long encode_delay_ms;
+} qw_diag_flags;
+static qw_diag_flags qw_diag; /* zero-initialized = everything off */
+
+static int qw_env_on(const char *name) {
+    const char *v = getenv(name);
+    if (!v || !*v) return 0;
+    return strcmp(v, "0") != 0 && strcasecmp(v, "off") != 0 &&
+           strcasecmp(v, "false") != 0;
+}
+
+/* QWEN_ENCODE_DELAY_MS: per-layer artificial CPU-encode delay (used for
+ * the 2026-11-04 encode-tax experiment). usleep() requires < 1e6 us, so
+ * clamp to 0..999 ms; atoi() used to overflow int and wrap negatives into
+ * a ~71-minute sleep or return EINVAL without the caller noticing. */
+static long qw_env_delay_ms(void) {
+    const char *v = getenv("QWEN_ENCODE_DELAY_MS");
+    if (!v || !*v) return 0;
+    char *end = NULL;
+    errno = 0;
+    long ms = strtol(v, &end, 10);
+    if (!end || end == v || *end || errno == ERANGE || ms < 0) {
+        fprintf(stderr, "warning: QWEN_ENCODE_DELAY_MS must be 0..999\n");
+        return 0;
+    }
+    if (ms > 999) {
+        fprintf(stderr, "warning: QWEN_ENCODE_DELAY_MS clamped to 999\n");
+        ms = 999;
+    }
+    return ms;
+}
+
+static void qw_diag_init(void) {
+    qw_diag.block_profile = qw_env_on("QWEN_BLOCK_PROFILE");
+    qw_diag.mlp_unfused = qw_env_on("QWEN_MLP_UNFUSED");
+    qw_diag.no_step_cache = qw_env_on("QWEN_NO_STEP_CACHE");
+    qw_diag.flash_attn = qw_env_on("QWEN_FLASH_ATTN");
+    qw_diag.no_prefix = qw_env_on("QWEN_NO_PREFIX");
+    qw_diag.dit_dump = qw_env_on("QWEN_DIT_DUMP");
+    qw_diag.encode_delay_ms = qw_env_delay_ms();
+}
+
+static void qw_encode_delay(void) {
+    long ms = qw_diag.encode_delay_ms;
+    if (ms > 0) usleep((useconds_t)ms * 1000u);
+}
 
 /* Block-stage profiler (QWEN_BLOCK_PROFILE=1): wall-clock each stage and
  * force a submit+begin after it. Distorts pipelining — diagnostics only. */
@@ -30,8 +92,8 @@ static uint32_t qw_bp_blocks;
 static double qw_bp_last;
 
 static double qw_bp_now(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
@@ -39,7 +101,7 @@ static double qw_bp_now(void) {
  * and wait first, so the recorded span covers this stage's encode plus
  * its full GPU execution. */
 static int qw_bp_mark(h3_gpu *gpu, int slot, int ok) {
-    if (!getenv("QWEN_BLOCK_PROFILE")) return ok;
+    if (!qw_diag.block_profile) return ok;
     if (!ok) return 0;
     if (!h3_gpu_submit(gpu) || !h3_gpu_begin(gpu)) return 0;
     double now = qw_bp_now();
@@ -49,18 +111,23 @@ static int qw_bp_mark(h3_gpu *gpu, int slot, int ok) {
 }
 
 static void qw_bp_report(void) {
-    if (!getenv("QWEN_BLOCK_PROFILE") || !qw_bp_blocks) return;
     static const char *names[QW_BP_SLOTS] = {
         "input(LN0+qkv+rope)", "attention", "to_out+gate", "LN1", "mlp+gate"};
-    fprintf(stderr, "[block-profile] per layer/step, %u blocks:\n",
-            qw_bp_blocks);
-    double total = 0;
-    for (int i = 0; i < QW_BP_SLOTS; i++) {
-        fprintf(stderr, "  %-20s %7.2f ms\n", names[i],
-                qw_bp_acc[i] * 1e3 / qw_bp_blocks);
-        total += qw_bp_acc[i];
+    if (qw_diag.block_profile && qw_bp_blocks) {
+        fprintf(stderr, "[block-profile] per layer/step, %u blocks:\n",
+                qw_bp_blocks);
+        double total = 0;
+        for (int i = 0; i < QW_BP_SLOTS; i++) {
+            fprintf(stderr, "  %-20s %7.2f ms\n", names[i],
+                    qw_bp_acc[i] * 1e3 / qw_bp_blocks);
+            total += qw_bp_acc[i];
+        }
+        fprintf(stderr, "  %-20s %7.2f ms\n", "total(sync)",
+                total * 1e3 / qw_bp_blocks);
     }
-    fprintf(stderr, "  %-20s %7.2f ms\n", "total(sync)", total * 1e3 / qw_bp_blocks);
+    /* Always reset: a failed block used to leave the accumulators
+     * half-filled and the early return carried them into the next
+     * request's average. */
     memset(qw_bp_acc, 0, sizeof(qw_bp_acc));
     qw_bp_blocks = 0;
 }
@@ -167,6 +234,7 @@ static uint16_t qw_f32_to_bits(float value) {
 
 qw_dit *qw_dit_create(h3_gpu *gpu, const char *model_dir, int layers,
                       char *error, size_t error_size) {
+    qw_diag_init();
     char path[4096];
     snprintf(path, sizeof(path), "%s/transformer", model_dir);
     h3_weight_store *store = h3_weight_store_open(path, error, error_size);
@@ -883,7 +951,10 @@ int qw_dit_switch_lora(qw_dit *dit, const char *path, float scale,
      * before the copy would leave a dangling entry for lora_reset_state
      * to double-free). */
     char *path_copy = strdup(path);
-    if (!path_copy) return set_error(error, error_size, "out of memory");
+    if (!path_copy) {
+        h3_st_free_header(&header);
+        return set_error(error, error_size, "out of memory");
+    }
     free(dit->lora[0].path);
     h3_st_free_header(&dit->lora[0].header);
     dit->lora[0].path = path_copy;
@@ -1120,6 +1191,32 @@ int qw_dit_conditioning(qw_dit *dit, const h3_gpu_tensor *features,
     return 1;
 }
 
+/* MLP sub-pass shared by the full block and the ti2i target-only chain.
+ * QWEN_MLP_UNFUSED=1 splits the fused MPSGraph for the encode-tax A/B;
+ * both paths must honour it, otherwise the diagnostic only covers the
+ * first (full) sampling step while the cached steps stay fused. */
+static int dit_mlp(qw_dit *dit, h3_gpu_tensor *out,
+                   const h3_gpu_tensor *in, const qw_dit_layer *layer,
+                   uint32_t rows, char *error, size_t error_size) {
+    if (!qw_diag.mlp_unfused)
+        return h3_gpu_mlp_bf16(dit->gpu, out, in, layer->fc1, layer->fc2,
+                               rows, QWEN_HIDDEN, QWEN_DIT_MLP,
+                               QWEN_HIDDEN);
+    h3_gpu_tensor *wide = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)rows * 2 * QWEN_DIT_MLP);
+    h3_gpu_tensor *act = h3_gpu_tensor_new_bf16(
+        dit->gpu, (size_t)rows * QWEN_DIT_MLP);
+    int ok = wide && act &&
+             run_linear(dit, wide, in, layer->fc1, rows, QWEN_HIDDEN,
+                        2 * QWEN_DIT_MLP, error, error_size, "fc1_u") &&
+             h3_gpu_swiglu_bf16(dit->gpu, act, wide, rows, QWEN_DIT_MLP) &&
+             run_linear(dit, out, act, layer->fc2, rows, QWEN_DIT_MLP,
+                        QWEN_HIDDEN, error, error_size, "fc2_u");
+    h3_gpu_tensor_free(wide);
+    h3_gpu_tensor_free(act);
+    return ok;
+}
+
 int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
                  const h3_gpu_tensor *modulation,
                  const h3_gpu_tensor *rope_cos, const h3_gpu_tensor *rope_sin,
@@ -1155,7 +1252,7 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
     if (!ok) {
         goto block_fail;
     }
-    if (getenv("QWEN_BLOCK_PROFILE")) qw_bp_last = qw_bp_now();
+    if (qw_diag.block_profile) qw_bp_last = qw_bp_now();
 
     ok = qw_gpu_layer_norm_mod_bf16(
              dit->gpu, modulated, hidden, modulation, row_map, rows,
@@ -1193,7 +1290,7 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
          * table. QWEN_FLASH_ATTN=1 or a missing layout falls back to
          * the single prefix kernel over all rows; QWEN_NO_PREFIX keeps
          * the full-attention probe. */
-        if (!getenv("QWEN_FLASH_ATTN") && !getenv("QWEN_NO_PREFIX") &&
+        if (!qw_diag.flash_attn && !qw_diag.no_prefix &&
             segs && seg_count) {
             uint32_t seg_start = 0;
             for (uint32_t s = 0; ok && s < seg_count; s++) {
@@ -1259,7 +1356,7 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
                 dit->gpu, (size_t)q_pad_rows * QWEN_HIDDEN);
             ok = q_pad &&
                  h3_gpu_copy_bf16(dit->gpu, q_pad, 0, q, 0, elements) &&
-                 (getenv("QWEN_NO_PREFIX")
+                 (qw_diag.no_prefix
                       ? qw_gpu_flash_sdpa_bf16(dit->gpu, attn, q_pad, k, v, rows,
                                                rows, QWEN_HEADS, QWEN_HEAD_DIM,
                                                QWEN_DIT_ATTENTION_SCALE)
@@ -1310,7 +1407,7 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
          * consumes exact row counts; the legacy flash2 kernel
          * (QWEN_FLASH_ATTN=1) reads whole 64-row query tiles and needs
          * the padded allocation. */
-        uint32_t q_alloc_rows = getenv("QWEN_FLASH_ATTN")
+        uint32_t q_alloc_rows = qw_diag.flash_attn
             ? (image_rows + 63u) & ~63u
             : image_rows;
         h3_gpu_tensor *q_img = h3_gpu_tensor_new_bf16(
@@ -1322,7 +1419,7 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
             ok = h3_gpu_copy_bf16(dit->gpu, q_img, 0, q,
                                   (size_t)text_rows * QWEN_HIDDEN,
                                   (size_t)image_rows * QWEN_HIDDEN) &&
-                 (getenv("QWEN_FLASH_ATTN")
+                 (qw_diag.flash_attn
                       ? qw_gpu_flash_sdpa_bf16(dit->gpu, attn_img, q_img, k,
                                                v, image_rows, rows,
                                                QWEN_HEADS, QWEN_HEAD_DIM,
@@ -1363,15 +1460,14 @@ int qw_dit_block(qw_dit *dit, int layer_index, h3_gpu_tensor *hidden,
     if (!ok) {
         goto block_fail;
     }
-    ok = h3_gpu_mlp_bf16(dit->gpu, branch, modulated, layer->fc1, layer->fc2,
-                         rows, QWEN_HIDDEN, QWEN_DIT_MLP, QWEN_HIDDEN) &&
-         h3_gpu_gate_bf16(dit->gpu, hidden, hidden, branch, modulation,
-                          row_map, rows, QWEN_HIDDEN, QWEN_DIT_SLOTS, 3);
+    ok = dit_mlp(dit, branch, modulated, layer, rows, error, error_size);
+    ok = ok && h3_gpu_gate_bf16(dit->gpu, hidden, hidden, branch, modulation,
+                                row_map, rows, QWEN_HIDDEN, QWEN_DIT_SLOTS, 3);
     ok = qw_bp_mark(dit->gpu, QW_BP_MLP, ok);
     if (!ok) {
         goto block_fail;
     }
-    if (getenv("QWEN_BLOCK_PROFILE")) qw_bp_blocks++;
+    if (qw_diag.block_profile) qw_bp_blocks++;
     return 1;
 
 block_fail:
@@ -1454,6 +1550,7 @@ int qw_dit_forward(qw_dit *dit, const h3_gpu_tensor *text_in,
                                   rope_sin, row_map_t, rows, text_rows, NULL,
                                   NULL, 0, NULL, NULL, NULL, error,
                                   error_size);
+                if (ok) qw_encode_delay();
             }
             qw_bp_report();
             if (ok) {
@@ -1598,8 +1695,8 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
                 c->target_rows == target_rows &&
                 c->seg_count == seg_count &&
                 ti2i_segs_match(c->segs, segs, seg_count) &&
-                !getenv("QWEN_NO_STEP_CACHE") &&
-                !getenv("QWEN_FLASH_ATTN") && !getenv("QWEN_NO_PREFIX");
+                !qw_diag.no_step_cache &&
+                !qw_diag.flash_attn && !qw_diag.no_prefix;
     /* A cache allocated this call is EMPTY until the full pass fills it:
      * any failure below must drop it again, or the next call's reuse
      * check would happily serve uninitialized/half-filled K/V. */
@@ -1649,8 +1746,11 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
             h3_gpu_tensor_free(row_map_t);
             h3_gpu_tensor_free(limits_t);
             if (fresh) ti2i_cache_free(dit, cache_idx);
+            char detail[256];
+            snprintf(detail, sizeof(detail), "%s",
+                     (error && error_size && error[0]) ? error : "alloc");
             return set_error(error, error_size, "ti2i forward setup failed: %s",
-                             error[0] ? error : "alloc");
+                             detail);
         }
     } else {
         /* Target-only setup: re-embed the new target latents (this step's
@@ -1673,9 +1773,11 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
                              (size_t)t_base * (QWEN_HEAD_DIM / 2),
                              (size_t)t_rows * (QWEN_HEAD_DIM / 2));
         if (!ok) {
+            char detail[256];
+            snprintf(detail, sizeof(detail), "%s",
+                     (error && error_size && error[0]) ? error : "alloc");
             return set_error(error, error_size,
-                             "ti2i target setup failed: %s",
-                             error[0] ? error : "alloc");
+                             "ti2i target setup failed: %s", detail);
         }
     }
 
@@ -1693,15 +1795,18 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
          qw_dit_conditioning(dit, features_t, 2, temb, modulation,
                              norm_scale, error, error_size);
     {
-        const char *dd = getenv("QWEN_DIT_DUMP");
-        if (dd && dd[0]) {
+        const char *dd = qw_diag.dit_dump ? getenv("QWEN_DIT_DUMP") : NULL;
+        if (dd && dd[0] && ok) {
             FILE *df = NULL;
             char fpath[4096];
             /* dump 的 read 需要命令已提交；submit 不重开命令缓冲，这里
              * 立即 begin，否则下方 `submit && begin` 链会因缓冲已关而
              * 短路成 forward 失败。 */
-            h3_gpu_submit(dit->gpu);
-            h3_gpu_begin(dit->gpu);
+            if (!h3_gpu_submit(dit->gpu) || !h3_gpu_begin(dit->gpu)) {
+                ok = 0;
+                set_error(error, error_size, "dit dump submit failed: %s",
+                          h3_gpu_error(dit->gpu));
+            }
             snprintf(fpath, sizeof(fpath), "%s/features.bin", dd);
             df = fopen(fpath, "wb");
             if (df) { fwrite(features, 4, 512, df); fclose(df); }
@@ -1719,8 +1824,8 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
     h3_gpu_tensor_free(features_t);
     h3_gpu_tensor_free(temb);
     {
-        const char *dd = getenv("QWEN_DIT_DUMP");
-        if (dd && dd[0]) {
+        const char *dd = qw_diag.dit_dump ? getenv("QWEN_DIT_DUMP") : NULL;
+        if (dd && dd[0] && ok) {
             size_t mn = (size_t)2 * 4 * QWEN_HIDDEN;
             uint16_t *mb = malloc(sizeof(uint16_t) * mn);
             if (mb && h3_gpu_tensor_read_bf16(modulation, mb, mn)) {
@@ -1752,6 +1857,7 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
                               row_map_t, rows, 0, limits_t, segs, seg_count,
                               c->k[i], c->v[i], NULL, error,
                               error_size);
+            if (ok) qw_encode_delay();
         }
         qw_bp_report();
         if (ok) {
@@ -1807,9 +1913,8 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
                      dit->gpu, c->mod, c->th, modulation,
                      c->row0, t_rows, QWEN_HIDDEN, QWEN_DIT_SLOTS, 1,
                      1e-6f) &&
-                 h3_gpu_mlp_bf16(dit->gpu, c->branch, c->mod,
-                                 layer->fc1, layer->fc2, t_rows, QWEN_HIDDEN,
-                                 QWEN_DIT_MLP, QWEN_HIDDEN) &&
+                 dit_mlp(dit, c->branch, c->mod, layer, t_rows, error,
+                         error_size) &&
                  h3_gpu_gate_bf16(dit->gpu, c->th, c->th,
                                   c->branch, modulation,
                                   c->row0, t_rows, QWEN_HIDDEN,
@@ -1819,6 +1924,7 @@ int qw_dit_forward_ti2i(qw_dit *dit, const h3_gpu_tensor *text_in,
                           h3_gpu_error(dit->gpu));
                 break;
             }
+            qw_encode_delay();
         }
         /* Final norm + projection on the target rows only; the result
          * lands in the trailing segment of the full output. */

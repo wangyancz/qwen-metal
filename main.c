@@ -12,6 +12,8 @@
 #include "qwen_vae.h"
 #include "linenoise.h"
 
+#include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,6 +93,58 @@ typedef struct {
     qw_sched_cfg sched;
 } engine;
 
+/* Build "<dir>/<rel>" without silently truncating a long -d path: a
+ * truncated config path would make load_engine fall back to the default
+ * scheduler (base rules applied to a turbo model corrupt its sigmas). */
+static int make_config_path(char *dst, size_t cap, const char *dir,
+                            const char *rel) {
+    int n = snprintf(dst, cap, "%s/%s", dir, rel);
+    return n >= 0 && (size_t)n < cap;
+}
+
+/* Read a small config file into a NUL-terminated heap buffer. ftell()
+ * returns -1 on a non-seekable file (FIFO/pipe); without the check,
+ * (size_t)-1 + 1 wraps to malloc(0) while fread is still handed the
+ * wrapped length, i.e. a heap overflow. Config files are optional, so a
+ * read/parse failure must not clobber the caller's error buffer. */
+static char *read_config_text(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    char *text = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) {
+        long size = ftell(f);
+        if (size >= 0 && size <= 8 * 1024 * 1024 &&
+            fseek(f, 0, SEEK_SET) == 0) {
+            text = malloc((size_t)size + 1);
+            if (text) {
+                if (fread(text, 1, (size_t)size, f) == (size_t)size &&
+                    !memchr(text, 0, (size_t)size)) {
+                    text[size] = 0;
+                } else {
+                    free(text);
+                    text = NULL;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return text;
+}
+
+/* A failed GPU operation can leave an open (uncommitted) command buffer
+ * whose encoded commands still reference tensors freed by the failing
+ * path. The next request would then either commit those stale commands
+ * or fail h3_gpu_begin() forever (inflightCommands non-empty). Drain at
+ * every resident request boundary so one failed generation cannot
+ * poison the whole worker. Also satisfies lora_rebuild's "no encoded
+ * command references the tensors" contract before tensor_write_bf16. */
+static void reset_gpu_chain(h3_gpu *gpu) {
+    (void)h3_gpu_submit(gpu); /* no open buffer -> returns 0, harmless */
+    if (!h3_gpu_begin(gpu) && !h3_gpu_continue(gpu))
+        fprintf(stderr, "warning: cannot reopen GPU command chain: %s\n",
+                h3_gpu_error(gpu));
+}
+
 /* Tear down a possibly half-built engine. The sub-objects normally live
  * as long as the process, so the only callers are load_engine's failure
  * paths — they matter because a load failure is reported and the process
@@ -138,34 +192,28 @@ static int load_engine(const char *dir, engine *eng, char *error,
     }
 
     char config_path[1024];
-    snprintf(config_path, sizeof(config_path), "%s/model_index.json", dir);
-    FILE *file = fopen(config_path, "rb");
-    if (file) {
-        fseek(file, 0, SEEK_END);
-        long size = ftell(file);
-        fseek(file, 0, SEEK_SET);
-        char *body = malloc((size_t)size + 1);
-        if (body && fread(body, 1, (size_t)size, file) == (size_t)size) {
-            body[size] = 0;
-            qw_json *index = NULL;
-            if (qw_json_parse(body, &index, error, error_size)) {
-                const qw_json *list = qw_json_get(index, "sample_sigmas");
-                if (list && qw_json_type(list) == QWEN_JSON_ARRAY) {
-                    eng->turbo_count = (uint32_t)qw_json_count(list);
-                    if (eng->turbo_count > 64) eng->turbo_count = 64;
-                    for (uint32_t i = 0; i < eng->turbo_count; i++)
-                        eng->turbo_sigmas[i] =
-                            qw_json_number(qw_json_at(list, i));
-                }
-                qw_json_free(index);
-            } else {
-                error[0] = 0;
+    if (!make_config_path(config_path, sizeof(config_path), dir,
+                          "model_index.json")) {
+        snprintf(error, error_size, "model dir path too long");
+        free_engine(eng);
+        return 0;
+    }
+    char *body = read_config_text(config_path);
+    if (body) {
+        qw_json *index = NULL;
+        if (qw_json_parse(body, &index, error, error_size)) {
+            const qw_json *list = qw_json_get(index, "sample_sigmas");
+            if (list && qw_json_type(list) == QWEN_JSON_ARRAY) {
+                eng->turbo_count = (uint32_t)qw_json_count(list);
+                if (eng->turbo_count > 64) eng->turbo_count = 64;
+                for (uint32_t i = 0; i < eng->turbo_count; i++)
+                    eng->turbo_sigmas[i] = qw_json_number(qw_json_at(list, i));
             }
-            free(body);
+            qw_json_free(index);
         } else {
-            free(body);
+            error[0] = 0;  // model_index.json is optional
         }
-        fclose(file);
+        free(body);
     }
 
     /* Scheduler behaviour from scheduler/scheduler_config.json. The
@@ -174,9 +222,12 @@ static int load_engine(const char *dir, engine *eng, char *error,
      * sample_sigmas are consumed as-is (applying the base rules to
      * them corrupts the sigma trajectory and softens the image). */
     {
-        snprintf(config_path, sizeof(config_path),
-                 "%s/scheduler/scheduler_config.json", dir);
-        FILE *sched_file = fopen(config_path, "rb");
+        if (!make_config_path(config_path, sizeof(config_path), dir,
+                              "scheduler/scheduler_config.json")) {
+            snprintf(error, error_size, "model dir path too long");
+            free_engine(eng);
+            return 0;
+        }
         qw_sched_cfg *sched = &eng->sched;
         memset(sched, 0, sizeof(*sched));
         sched->base_seq = 256.0;
@@ -186,43 +237,32 @@ static int load_engine(const char *dir, engine *eng, char *error,
         sched->dynamic_shifting = 1;
         sched->has_terminal = 1;
         sched->shift_terminal = 0.02;
-        if (sched_file) {
-            fseek(sched_file, 0, SEEK_END);
-            long size = ftell(sched_file);
-            fseek(sched_file, 0, SEEK_SET);
-            char *body = malloc((size_t)size + 1);
-            if (body && fread(body, 1, (size_t)size, sched_file) ==
-                            (size_t)size) {
-                body[size] = 0;
-                qw_json *json = NULL;
-                if (qw_json_parse(body, &json, error, error_size)) {
-                    sched->dynamic_shifting =
-                        qw_json_get_bool(json, "use_dynamic_shifting", 1);
-                    sched->base_seq = qw_json_get_number(
-                        json, "base_image_seq_len", 256.0);
-                    sched->max_seq = qw_json_get_number(
-                        json, "max_image_seq_len", 8192.0);
-                    sched->base_shift =
-                        qw_json_get_number(json, "base_shift", 0.5);
-                    sched->max_shift =
-                        qw_json_get_number(json, "max_shift", 0.9);
-                    const qw_json *terminal =
-                        qw_json_get(json, "shift_terminal");
-                    sched->has_terminal = terminal && qw_json_type(terminal) !=
-                                                                 QWEN_JSON_NULL;
-                    sched->shift_terminal =
-                        sched->has_terminal
-                            ? qw_json_get_number(json, "shift_terminal", 0.02)
-                            : 0.0;
-                    qw_json_free(json);
-                } else {
-                    error[0] = 0;  // defaults above already mirror base
-                }
-                free(body);
+        char *sched_body = read_config_text(config_path);
+        if (sched_body) {
+            qw_json *json = NULL;
+            if (qw_json_parse(sched_body, &json, error, error_size)) {
+                sched->dynamic_shifting =
+                    qw_json_get_bool(json, "use_dynamic_shifting", 1);
+                sched->base_seq =
+                    qw_json_get_number(json, "base_image_seq_len", 256.0);
+                sched->max_seq =
+                    qw_json_get_number(json, "max_image_seq_len", 8192.0);
+                sched->base_shift =
+                    qw_json_get_number(json, "base_shift", 0.5);
+                sched->max_shift =
+                    qw_json_get_number(json, "max_shift", 0.9);
+                const qw_json *terminal = qw_json_get(json, "shift_terminal");
+                sched->has_terminal = terminal && qw_json_type(terminal) !=
+                                                             QWEN_JSON_NULL;
+                sched->shift_terminal =
+                    sched->has_terminal
+                        ? qw_json_get_number(json, "shift_terminal", 0.02)
+                        : 0.0;
+                qw_json_free(json);
             } else {
-                free(body);
+                error[0] = 0;  // defaults above already mirror base
             }
-            fclose(sched_file);
+            free(sched_body);
         }
     }
     return 1;
@@ -258,13 +298,8 @@ static h3_gpu_tensor *encode_prompt(engine *eng, const char *prompt,
  * /width would otherwise start allocating tens of GB (and wrap the
  * 32-bit pixel count the pipeline derives from it) long before any
  * allocation actually fails. Out-of-range input keeps the old value. */
-static uint32_t repl_size_arg(const char *text, uint32_t fallback) {
-    unsigned long v = strtoul(text, NULL, 10);
-    if (v < 32 || v > 8192) {
-        fprintf(stderr, "width/height must be in [32, 8192]\n");
-        return fallback;
-    }
-    return (uint32_t)v;
+static int valid_size(uint32_t v) {
+    return v >= 32 && v <= 8192 && v % 32 == 0;
 }
 
 /* Strict numeric arg parsing for --width/--height/--steps and their REPL
@@ -272,22 +307,50 @@ static uint32_t repl_size_arg(const char *text, uint32_t fallback) {
  * /cfg garbage into a cfg=0 (guidance silently off) run. */
 static int parse_u32_arg(const char *text, uint32_t *out) {
     char *end = NULL;
+    errno = 0;
     unsigned long v = strtoul(text, &end, 10);
-    if (!end || end == text || *end) return 0;
+    if (!end || end == text || *end || errno == ERANGE) return 0;
     if (v > 0xfffffffful) return 0;
     *out = (uint32_t)v;
+    return 1;
+}
+
+static int parse_u64_arg(const char *text, uint64_t *out) {
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(text, &end, 10);
+    /* strtoull("-1") wraps to ULLONG_MAX, and "12abc" silently yields 12. */
+    if (!end || end == text || *end || errno == ERANGE || text[0] == '-')
+        return 0;
+    *out = (uint64_t)v;
     return 1;
 }
 
 static int parse_float_arg(const char *text, float *out) {
     char *end = NULL;
     float v = strtof(text, &end);
-    if (!end || end == text || *end) return 0;
+    /* strtof accepts "nan"/"inf" with end at the terminator; those would
+     * poison the CFG/LoRA scale into an all-NaN image. */
+    if (!end || end == text || *end || !isfinite(v)) return 0;
     *out = v;
     return 1;
 }
 
-static int valid_size(uint32_t v) { return v >= 32 && v <= 8192; }
+/* REPL sizes: reject garbage AND non-32-multiple values. *ok tells the
+ * caller whether width_set/height_set may be flipped — otherwise a typo
+ * silently changed the ti2i session from "derive size from reference" to
+ * "use the stale explicit size". */
+static uint32_t repl_size_arg(const char *text, uint32_t fallback, int *ok) {
+    uint32_t v = 0;
+    if (!parse_u32_arg(text, &v) || !valid_size(v)) {
+        fprintf(stderr,
+                "width/height must be a multiple of 32 in [32, 8192]\n");
+        *ok = 0;
+        return fallback;
+    }
+    *ok = 1;
+    return v;
+}
 
 /* Expand %llu in a user-supplied /out template. The template must never
  * reach snprintf as a format string: "/out %s.png" would pull a pointer
@@ -690,12 +753,14 @@ static int cmd_repl(const char *dir, const generate_args *args) {
         } else if (strcmp(text, "/show") == 0) {
             repl_show(&st);
         } else if (strncmp(text, "/width ", 7) == 0) {
-            st.width = repl_size_arg(text + 7, st.width);
-            st.width_set = 1;
+            int size_ok = 0;
+            st.width = repl_size_arg(text + 7, st.width, &size_ok);
+            if (size_ok) st.width_set = 1;
             repl_show(&st);
         } else if (strncmp(text, "/height ", 8) == 0) {
-            st.height = repl_size_arg(text + 8, st.height);
-            st.height_set = 1;
+            int size_ok = 0;
+            st.height = repl_size_arg(text + 8, st.height, &size_ok);
+            if (size_ok) st.height_set = 1;
             repl_show(&st);
         } else if (strncmp(text, "/steps ", 7) == 0) {
             uint32_t v;
@@ -705,7 +770,11 @@ static int cmd_repl(const char *dir, const generate_args *args) {
                 fprintf(stderr, "steps must be in [1, %u]\n", QWEN_STEPS_LIMIT);
             repl_show(&st);
         } else if (strncmp(text, "/seed ", 6) == 0) {
-            st.seed = strtoull(text + 6, NULL, 10);
+            uint64_t v;
+            if (parse_u64_arg(text + 6, &v))
+                st.seed = v;
+            else
+                fprintf(stderr, "error: /seed needs a non-negative integer\n");
             repl_show(&st);
         } else if (strncmp(text, "/cfg ", 5) == 0) {
             float v;
@@ -788,11 +857,11 @@ static int cmd_repl(const char *dir, const generate_args *args) {
                 fprintf(stderr, "error: %s\n", error);
             repl_sync_lora(&st, eng.dit);
             repl_show(&st);
-        } else if (text[0] == '/' && !strchr(text, ' ')) {
-            /* A bare "/width" (argument left off) used to fall through to
-             * the prompt branch and burn a full generation on it. Bare
-             * /neg /image /res /lora /show /help /quit are handled
-             * above. */
+        } else if (text[0] == '/') {
+            /* Any unrecognized directive used to fall through to the
+             * prompt branch. Bare directives were caught before; a typo
+             * with an argument ("/widht 1024") must not burn a full
+             * generation either. All legal forms are handled above. */
             fprintf(stderr,
                     "error: unknown directive or missing argument: %s"
                     " (see /help)\n", text);
@@ -900,8 +969,10 @@ static int cmd_repl(const char *dir, const generate_args *args) {
             h3_gpu_tensor_free(text_in);
             h3_gpu_tensor_free(neg_text_in);
         }
-        /* Request boundary, same as the serve loop: keeps the
+        /* Request boundary, same as the serve loop: drain any command
+         * chain left open by a failed generation, then keep the
          * shape-keyed MPSGraph caches from growing for the session. */
+        reset_gpu_chain(eng.gpu);
         h3_gpu_clear_graph_cache(eng.gpu);
         linenoiseFree(line);
     }
@@ -1063,6 +1134,35 @@ static void serve_json_escape(const char *in, char *out, size_t out_size) {
     out[o] = 0;
 }
 
+/* qw_json_get_number() returns a finite double (1e300 and -1 are both
+ * legal JSON). Casting an out-of-range double to an integer is UB, and a
+ * NaN/Inf cfgScale silently produces an all-NaN image. Clamp each field
+ * before the cast; a rejected field leaves *out at the default. */
+static int serve_json_u32(const qw_json *req, const char *key,
+                          uint32_t def, uint32_t *out) {
+    double v = qw_json_get_number(req, key, (double)def);
+    if (!(v >= 0.0 && v <= 4294967295.0)) return 0;
+    *out = (uint32_t)v;
+    return 1;
+}
+
+static int serve_json_u64(const qw_json *req, const char *key,
+                          uint64_t def, uint64_t *out) {
+    double v = qw_json_get_number(req, key, (double)def);
+    if (!(v >= 0.0 && v < 18446744073709551616.0)) return 0;
+    *out = (uint64_t)v;
+    return 1;
+}
+
+static int serve_json_f32(const qw_json *req, const char *key, float def,
+                          float *out) {
+    double v = qw_json_get_number(req, key, (double)def);
+    float f = (float)v;
+    if (!isfinite(v) || !isfinite(f)) return 0;
+    *out = f;
+    return 1;
+}
+
 /* Reconcile the engine's adapter stack with the request: qwen-web sends
  * at most one adapter (path + scale), the engine may still hold the
  * previous request's stack. Same path+scale is a no-op; a scale change
@@ -1204,7 +1304,14 @@ static int serve_generate_ti2i(engine *eng, const char *dir,
 
 static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
     char error[512] = {0};
-    const char *rid = qw_json_get_string(req, "id", "");
+    /* progress/heartbeat store the id in an 80-byte buffer. Use the very
+     * same truncated value for done/error so every event stays keyed to
+     * one id (Go matches progress and the terminal event by id). */
+    char rid[80];
+    snprintf(rid, sizeof(rid), "%s", qw_json_get_string(req, "id", ""));
+    /* A failed previous request may have left an open command buffer;
+     * drain it before LoRA rebuild writes tensors in place. */
+    reset_gpu_chain(eng->gpu);
     double t0 = now_seconds();
 
     pthread_mutex_lock(&g_serve.mu);
@@ -1219,15 +1326,24 @@ static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
     const char *negative = qw_json_get_string(req, "negativePrompt", "");
     const char *out = qw_json_get_string(req, "output", "");
     const char *lora = qw_json_get_string(req, "lora", "");
-    uint32_t width = (uint32_t)qw_json_get_number(req, "width", 1024);
-    uint32_t height = (uint32_t)qw_json_get_number(req, "height", 1024);
-    uint32_t steps = (uint32_t)qw_json_get_number(req, "steps", 40);
+    uint32_t width = 1024, height = 1024, steps = 40;
+    uint64_t seed = 0;
+    float cfg = 1.0f, lora_scale = 1.0f;
+    int bad = 0;
+    if (!serve_json_u32(req, "width", 1024, &width) ||
+        !serve_json_u32(req, "height", 1024, &height) ||
+        !serve_json_u32(req, "steps", 40, &steps) ||
+        !serve_json_u64(req, "seed", 0, &seed) ||
+        !serve_json_f32(req, "cfgScale", 1.0f, &cfg) ||
+        !serve_json_f32(req, "loraScale", 1.0f, &lora_scale)) {
+        snprintf(error, sizeof(error),
+                 "numeric parameter out of range (width/height/steps/seed/"
+                 "cfgScale/loraScale)");
+        bad = 1;
+    }
     /* turbo 蒸馏模型只按官方固定 sample_sigmas 轨迹定义：请求里的 steps
      * 与 diffusers worker / Go 侧归一口径一致地被忽略。 */
     if (eng->turbo_count) steps = eng->turbo_count;
-    uint64_t seed = (uint64_t)qw_json_get_number(req, "seed", 0);
-    float cfg = (float)qw_json_get_number(req, "cfgScale", 1.0);
-    float lora_scale = (float)qw_json_get_number(req, "loraScale", 1.0);
     /* Go 侧已限幅 0.05..1.5（同 worker.py 的钳制口径），双保险 */
     if (lora_scale < 0.05f) lora_scale = 0.05f;
     if (lora_scale > 1.5f) lora_scale = 1.5f;
@@ -1235,8 +1351,7 @@ static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
     const qw_json *imgs = qw_json_get(req, "images");
     const char *images[MAX_TI2I_IMAGES] = {0};
     uint32_t n_images = 0;
-    int bad = 0;
-    if (imgs && qw_json_type(imgs) == QWEN_JSON_ARRAY) {
+    if (!bad && imgs && qw_json_type(imgs) == QWEN_JSON_ARRAY) {
         size_t count = qw_json_count(imgs);
         if (count > MAX_TI2I_IMAGES) {
             snprintf(error, sizeof(error),
@@ -1260,14 +1375,25 @@ static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
     /* Sanity bounds: 0 slips through the %32 gate and huge values
      * would burn tens of GB in allocations before failing. The largest
      * released aspect bucket is 3520 px; 8192 is a generous ceiling. */
-    if (width < 32 || width > 8192 || height < 32 || height > 8192) {
+    if (!bad && (width < 32 || width > 8192 || height < 32 || height > 8192)) {
         snprintf(error, sizeof(error),
                  "width/height must be in [32, 8192] (got %ux%u)", width,
                  height);
         bad = 1;
     }
+    /* done.path is escaped into a fixed 1024-byte buffer and emitted in a
+     * 2048-byte line; an unbounded output string would be silently
+     * truncated there while the PNG is written to the full path. */
+    if (!bad && strlen(out) > 512) {
+        snprintf(error, sizeof(error), "output path too long (max 512 bytes)");
+        bad = 1;
+    }
+    /* Reject out-of-range steps before serve_sync_lora: an invalid request
+     * must not spend seconds (and ~14 GB of pool pages) rebuilding the
+     * adapter stack. */
     int gate = !bad && prompt[0] && out[0] && width % 32 == 0 &&
-               height % 32 == 0 && steps != 0;
+               height % 32 == 0 && steps >= 1 &&
+               steps <= QWEN_STEPS_LIMIT;
     int sync_ok = 1;
     if (gate) {
         sync_ok = serve_sync_lora(eng, lora[0] ? lora : NULL, lora_scale,
@@ -1321,11 +1447,15 @@ static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
                    rid_esc, out_esc, width, height,
                    has_alpha ? "true" : "false", now_seconds() - t0);
     } else {
-        char msg[1024];
+        /* The id is caller-supplied JSON: an unescaped quote/control byte
+         * here used to emit an unparsable error line, leaving the Go host
+         * waiting forever for a terminal event. */
+        char rid_esc[176], msg[1024];
+        serve_json_escape(rid, rid_esc, sizeof(rid_esc));
         serve_json_escape(error[0] ? error : "generation failed", msg,
                           sizeof(msg));
         serve_emit("{\"type\":\"error\",\"id\":\"%s\",\"message\":\"%s\"}",
-                   rid, msg);
+                   rid_esc, msg);
     }
     /* QWEN_SERVE_MEM=1: per-request memory line. live = h3 tensors still
      * referenced (a request-over-request climb means a tensor leak);
@@ -1341,10 +1471,12 @@ static void serve_handle(engine *eng, const char *dir, const qw_json *req) {
                 (double)st.peak_live_bytes / 1e9, phys_footprint_gb(),
                 qw_dit_lora_count(eng->dit));
     }
-    /* Request boundary: every MPSGraph in the shape caches would
-     * otherwise be kept for the process lifetime (each new prompt
-     * length / output size adds one, ~95 MB each). The next request
-     * recompiles the handful of shapes it needs. */
+    /* Request boundary: drain any still-open command chain (a failed
+     * generation leaves encoded commands referencing freed tensors),
+     * then drop the shape-keyed MPSGraph caches — each new prompt
+     * length / output size otherwise pins ~95 MB for the process
+     * lifetime. The next request recompiles the handful it needs. */
+    reset_gpu_chain(eng->gpu);
     h3_gpu_clear_graph_cache(eng->gpu);
 }
 
@@ -1377,7 +1509,10 @@ static int cmd_serve(const char *dir) {
         return 1;
     }
 
-    char line[65536];
+    /* 65536 payload bytes + '\n' + NUL: with a 65536-byte buffer a legal
+     * line of exactly 65535 bytes plus its newline filled the buffer and
+     * was misdetected as an over-long request. */
+    char line[65538];
     while (fgets(line, sizeof(line), stdin)) {
         size_t len = strlen(line);
         /* fgets silently splits an over-long request into two "lines":
@@ -1442,13 +1577,17 @@ int main(int argc, char **argv) {
             } else if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
                 if (!parse_u32_arg(argv[++i], &gen.width) ||
                     !valid_size(gen.width)) {
-                    fprintf(stderr, "error: --width must be in [32, 8192]\n");
+                    fprintf(stderr,
+                            "error: --width must be a multiple of 32"
+                            " in [32, 8192]\n");
                     return 1;
                 }
             } else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
                 if (!parse_u32_arg(argv[++i], &gen.height) ||
                     !valid_size(gen.height)) {
-                    fprintf(stderr, "error: --height must be in [32, 8192]\n");
+                    fprintf(stderr,
+                            "error: --height must be a multiple of 32"
+                            " in [32, 8192]\n");
                     return 1;
                 }
             } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
@@ -1459,7 +1598,11 @@ int main(int argc, char **argv) {
                     return 1;
                 }
             } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-                gen.seed = strtoull(argv[++i], NULL, 10);
+                if (!parse_u64_arg(argv[++i], &gen.seed)) {
+                    fprintf(stderr,
+                            "error: --seed needs a non-negative integer\n");
+                    return 1;
+                }
                 gen.seed_set = 1;
             } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
                 if (gen.n_images < MAX_TI2I_IMAGES)
@@ -1516,13 +1659,17 @@ int main(int argc, char **argv) {
             if (strcmp(argv[i], "--width") == 0 && i + 1 < argc) {
                 if (!parse_u32_arg(argv[++i], &gen.width) ||
                     !valid_size(gen.width)) {
-                    fprintf(stderr, "error: --width must be in [32, 8192]\n");
+                    fprintf(stderr,
+                            "error: --width must be a multiple of 32"
+                            " in [32, 8192]\n");
                     return 1;
                 }
             } else if (strcmp(argv[i], "--height") == 0 && i + 1 < argc) {
                 if (!parse_u32_arg(argv[++i], &gen.height) ||
                     !valid_size(gen.height)) {
-                    fprintf(stderr, "error: --height must be in [32, 8192]\n");
+                    fprintf(stderr,
+                            "error: --height must be a multiple of 32"
+                            " in [32, 8192]\n");
                     return 1;
                 }
             } else if (strcmp(argv[i], "--steps") == 0 && i + 1 < argc) {
@@ -1533,7 +1680,11 @@ int main(int argc, char **argv) {
                     return 1;
                 }
             } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
-                gen.seed = strtoull(argv[++i], NULL, 10);
+                if (!parse_u64_arg(argv[++i], &gen.seed)) {
+                    fprintf(stderr,
+                            "error: --seed needs a non-negative integer\n");
+                    return 1;
+                }
                 gen.seed_set = 1;
             } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
                 if (gen.n_images < MAX_TI2I_IMAGES)

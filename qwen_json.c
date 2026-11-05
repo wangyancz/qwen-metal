@@ -186,14 +186,26 @@ static char *parse_string(qw_json_parser *parser) {
                     return NULL;
                 }
                 p += 4;
-                if (code >= 0xD800 && code <= 0xDBFF && p[0] == '\\' &&
-                    p[1] == 'u') {
+                /* A NUL codepoint would truncate every strcmp() lookup
+                 * on the parsed string; isolated surrogates are invalid
+                 * UTF-8. Reject both instead of emitting WTF-8. */
+                if (code == 0 || (code >= 0xDC00 && code <= 0xDFFF)) {
+                    free(out);
+                    fail(parser, "bad \\u escape");
+                    return NULL;
+                }
+                if (code >= 0xD800 && code <= 0xDBFF) {
                     unsigned low = 0;
-                    if (parse_hex4(p + 2, &low) && low >= 0xDC00 &&
+                    if (p[0] == '\\' && p[1] == 'u' &&
+                        parse_hex4(p + 2, &low) && low >= 0xDC00 &&
                         low <= 0xDFFF) {
                         code = 0x10000 + ((code - 0xD800) << 10) +
                                (low - 0xDC00);
                         p += 6;
+                    } else {
+                        free(out);
+                        fail(parser, "unpaired surrogate");
+                        return NULL;
                     }
                 }
                 length += utf8_encode(code, out + length);
@@ -404,7 +416,8 @@ const qw_json *qw_json_get(const qw_json *value, const char *key) {
 }
 
 const qw_json *qw_json_at(const qw_json *value, size_t index) {
-    if (!value || index >= value->count) return NULL;
+    if (!value || value->kind != QWEN_JSON_ARRAY || index >= value->count)
+        return NULL;
     return value->items[index];
 }
 
@@ -450,5 +463,11 @@ const char *qw_json_get_string(const qw_json *value, const char *key,
 int qw_json_get_bool(const qw_json *value, const char *key, int fallback) {
     const qw_json *item = qw_json_get(value, key);
     if (!item) return fallback;
+    /* A wrong-typed key (array/object/null) must not silently override
+     * the documented default — e.g. "use_dynamic_shifting": [] used to
+     * disable dynamic shifting. */
+    if (item->kind == QWEN_JSON_NULL || item->kind == QWEN_JSON_ARRAY ||
+        item->kind == QWEN_JSON_OBJECT)
+        return fallback;
     return qw_json_bool(item);
 }

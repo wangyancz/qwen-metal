@@ -87,10 +87,12 @@ static void png_filter_select(uint8_t *raw, size_t stride, uint32_t height) {
         uint8_t *row = raw + 1 + (size_t)y * (stride + 1);
         const uint8_t *src = orig + (size_t)y * stride;
         int best_type = 0;
-        unsigned best_sum = ~0u;
+        /* stride can exceed 33M bytes on a legal (if huge) image; an
+         * unsigned accumulator would wrap and pick a suboptimal filter. */
+        unsigned long long best_sum = ~0ull;
         for (int type = 0; type < 5; type++) {
             png_filter_row(type, tmp, src, prev, stride, 4);
-            unsigned sum = 0;
+            unsigned long long sum = 0;
             for (size_t i = 0; i < stride; i++) {
                 unsigned v = tmp[i];
                 sum += v < 128 ? v : 256u - v;
@@ -141,6 +143,13 @@ int qw_png_write_rgba(const char *path, uint32_t width, uint32_t height,
     }
     size_t stride = (size_t)width * 4;
     size_t raw_size = (stride + 1) * height;
+    /* A PNG chunk length is an unsigned 31-bit field. Beyond that,
+     * compressBound()/the IDAT length truncate on the uint32_t cast and
+     * a corrupt file is written instead of the request being rejected. */
+    if (raw_size > 0x7fffffffu) {
+        snprintf(error, error_size, "png: image data too large");
+        return -1;
+    }
     uint8_t *raw = malloc(raw_size);
     if (!raw) {
         snprintf(error, error_size, "png: out of memory");
@@ -164,6 +173,12 @@ int qw_png_write_rgba(const char *path, uint32_t width, uint32_t height,
     if (deflate_result != Z_OK) {
         free(compressed);
         snprintf(error, error_size, "png: deflate failed");
+        return -1;
+    }
+    if (compressed_size > 0x7fffffffu) {
+        free(compressed);
+        snprintf(error, error_size,
+                 "png: deflate output too large for one IDAT chunk");
         return -1;
     }
     FILE *file = fopen(path, "wb");
@@ -222,6 +237,8 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
     uint32_t w = 0, h = 0;
     int color_type = -1, bit_depth = -1;
     int have_ihdr = 0;
+    int first_chunk = 1;
+    int truncated = 0;
     uint8_t *idat = NULL;
     size_t idat_len = 0, idat_cap = 0;
     for (;;) {
@@ -241,11 +258,13 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
         uint8_t *data = malloc(len ? len : 1);
         if (!data || (len && fread(data, 1, len, file) != len)) {
             free(data);
+            truncated = 1;
             break;
         }
         uint8_t crc_bytes[4] = {0};
         if (fread(crc_bytes, 1, 4, file) != 4) {
             free(data);
+            truncated = 1;
             break;
         }
         uint32_t crc = png_crc(0, (const uint8_t *)type, 4);
@@ -261,7 +280,7 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
         if (!memcmp(type, "IHDR", 4)) {
             /* IHDR is exactly 13 bytes; shorter chunks previously read
              * past the allocation for bit depth / color type / interlace. */
-            if (have_ihdr || len != 13) {
+            if (!first_chunk || have_ihdr || len != 13) {
                 free(data);
                 free(idat);
                 fclose(file);
@@ -273,6 +292,14 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
             h = png_parse_be32(data + 4);
             bit_depth = data[8];
             color_type = data[9];
+            if (data[10] != 0 || data[11] != 0) {
+                free(data);
+                free(idat);
+                fclose(file);
+                snprintf(error, error_size,
+                         "png: unsupported compression/filter method");
+                return 1;
+            }
             if (data[12] != 0) {
                 free(data);
                 free(idat);
@@ -307,8 +334,16 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
             break;
         }
         free(data);
+        first_chunk = 0;
     }
     fclose(file);
+    /* A short chunk read used to `break` and then accept whatever IDAT
+     * had already been accumulated — a truncated file decoded "successfully". */
+    if (truncated) {
+        free(idat);
+        snprintf(error, error_size, "png: truncated chunk data");
+        return 1;
+    }
     if (!w || !h || color_type < 0 || bit_depth != 8 || !idat) {
         free(idat);
         snprintf(error, error_size,
@@ -365,6 +400,14 @@ int qw_png_read_rgba(const char *path, uint32_t *width, uint32_t *height,
     size_t stride = (size_t)w * channels;
     for (uint32_t y = 0; y < h; y++) {
         uint8_t filter = raw[y * (stride + 1)];
+        /* PNG defines filters 0..4; silently treating 5..255 as filter 0
+         * produced wrong pixels while reporting success. */
+        if (filter > 4) {
+            free(raw);
+            snprintf(error, error_size, "png: invalid row filter %u",
+                     (unsigned)filter);
+            return 1;
+        }
         uint8_t *line = raw + y * (stride + 1) + 1;
         for (size_t x = 0; x < stride; x++) {
             int a = x >= (size_t)channels ? line[x - channels] : 0;

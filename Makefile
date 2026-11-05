@@ -23,7 +23,9 @@ CLI_OBJ := main.o
 
 .PHONY: all host-tests dit-fixture dit-tests text-fixture text-tests \
 	vlm-fixture vlm-tests vae-fixture vae-tests pipeline-tests \
-	vision-fixture vision-tests lora-tests clean
+	vision-fixture vision-tests lora-tests ti2ifixture-tests png-tests \
+	imgproc-fixture imgproc-tests ti2itext-tests prefix-kernel-test \
+	bench-linear bench-sdpa vae-conv-ci-tests clean
 
 all: qwen libqwen.a
 
@@ -72,6 +74,12 @@ lora-tests: tests/test_lora
 tests/test_png: tests/test_png.o libqwen.a
 	$(CC) -o $@ $^ $(LDLIBS)
 
+tests/test_vae_conv_ci: tests/test_vae_conv_ci.o libqwen.a
+	$(CC) -o $@ $^ $(LDLIBS)
+
+vae-conv-ci-tests: tests/test_vae_conv_ci
+	./tests/test_vae_conv_ci
+
 png-tests: tests/test_png
 	./tests/test_png
 
@@ -114,11 +122,14 @@ prefix-kernel-test: tests/test_prefix_kernel
 vae-tests: tests/test_vae
 	./tests/test_vae
 
-%.o: %.c
-	$(CC) $(CFLAGS) -I. -c $< -o $@
-
+# The .m rule must come first: with make's pattern-rule ordering a stray
+# empty <name>.c would otherwise silently compile a <name>.m target into
+# an empty object file.
 %.o: %.m
 	$(CC) $(OBJCFLAGS) -I. -c $< -o $@
+
+%.o: %.c
+	$(CC) $(CFLAGS) -I. -c $< -o $@
 
 tests/%.o: tests/%.c
 	$(CC) $(CFLAGS) -I. -c $< -o $@
@@ -126,7 +137,8 @@ tests/%.o: tests/%.c
 -include $(wildcard *.d tests/*.d)
 
 clean:
-	rm -f libqwen.a *.o *.d tests/*.o tests/*.d tests/test_host
+	rm -f libqwen.a *.o *.d tests/*.o tests/*.d qwen
+	find tests -maxdepth 1 -type f ! -name '*.*' -delete
 
 PIPELINE_TEST_SRC := tests/test_pipeline.c
 BENCH_LINEAR_SRC := tests/bench_linear.c
@@ -141,6 +153,9 @@ pipeline-tests: tests/test_pipeline
 
 tests/test_vision: tests/test_vision.o libqwen.a
 	$(CC) -o $@ $^ $(LDLIBS)
+
+vision-fixture:
+	$(PYTHON) tests/gen_vision_fixture.py
 
 vision-tests: tests/test_vision
 	./tests/test_vision

@@ -1,5 +1,7 @@
 # qwen-metal
 
+English | [简体中文](README-ZH.md)
+
 A native **Qwen-Image-2.1** text-to-image inference engine for Apple Silicon (Metal).
 
 Pure C11 + Objective-C with zero Python runtime dependency: the text encoder (Qwen3-VL text tower), the 7B DiT, the VAE decoder, and the FlowMatch scheduler all run on hand-written Metal kernels and MPSGraph — one command takes you from prompt to PNG.
@@ -26,7 +28,7 @@ qwen generate -d /path/to/Qwen-Image-2.1.models \
 | Chip | Apple Silicon (validated on M5 Max; the TensorOps path needs M5, other chips fall back to plain kernels automatically) |
 | OS | macOS (Metal / MPSGraph runtime required) |
 | Toolchain | Xcode command line tools (clang + ObjC + Metal frameworks); zlib ships with the OS |
-| Unified memory | **16 GB minimum** (~17 GB peak at 1024²); the largest official size tops out at ≤ 47 GB, comfortable on 64 GB |
+| Unified memory | **32 GB recommended** (~17 GB peak at 1024², ~10 GB at 512²); the largest official size tops out at ≤ 47 GB, comfortable on 64 GB |
 | Disk | Model weights 31 GB (base) / 30 GB (turbo) |
 
 ## Getting the model
@@ -67,7 +69,13 @@ All make targets:
 | `make text-tests` | Text encoder tokenization + 36-layer hidden states | Yes |
 | `make vae-tests` | VAE ~50-segment comparison | Yes |
 | `make lora-tests` | LoRA fusion numeric parity + attach/detach lifecycle | Yes + LoRA files |
-| `make dit-fixture` etc. | Regenerate equivalence fixtures | Yes + diffusers environment |
+| `make prefix-kernel-test` | Prefix SDPA kernel vs CPU reference | Yes |
+| `make vae-conv-ci-tests` | VAE convolution identity-weight parity across channel shapes | Yes |
+| `make png-tests` / `make vision-tests` / `make imgproc-tests` | PNG hardening / vision tower / image preprocessing | No / Yes / No |
+| `make ti2ifixture-tests` | Seven offline ti2i fixture comparisons (template / vision / text / cond / DiT pred) | Yes |
+| `make vlm-tests` / `make ti2itext-tests` | VLM text tower / ti2i text + DiT mini pipeline | Yes |
+| `make bench-linear` / `make bench-sdpa` | Linear-layer / SDPA microbenchmarks | Yes |
+| `make *-fixture` (dit / text / vae / vision / imgproc / vlm / ti2i / pipeline) | Regenerate equivalence fixtures | Yes + diffusers environment |
 | `make clean` | Remove build artifacts | — |
 
 Quick verification that does not need model weights:
@@ -96,7 +104,7 @@ qwen generate -d MODEL_DIR -p "PROMPT" [options]
 | `--negative TEXT` | Negative prompt (used with `--cfg > 1`) | — |
 | `--width N` / `--height N` | Output size (multiple of 32, [32, 8192]) | 1024 × 1024 |
 | `--steps N` | Denoising steps ([1, 1000]; turbo always takes 8) | base: 40 |
-| `--seed N` | Random seed (same seed reproduces the same image) | 0 |
+| `--seed N` | Random seed (0 is a valid seed; same seed reproduces the same image) | `time(NULL)` if omitted |
 | `--cfg F` | Guidance strength (>1 enables CFG) | 1.0 |
 | `--lora PATH` | LoRA adapter (safetensors; repeatable, up to 8 stacked — see section below) | — |
 | `--lora-scale F` | Strength for the i-th `--lora` (repeat to pair in order; default 1.0, not clamped) | 1.0 |
@@ -412,12 +420,27 @@ Optimization log:
   [rows, hidden] activation buffers allocated once per forward, reallocated when t2i/ti2i switch row
   counts), q/k/v pre-concatenation (`qw_gpu_qkv_bf16`: a single MPSGraph graph does the 3 matmuls
   sharing one input, weights stay in native [out, in] zero-copy layout, encodes per layer 3→1).
-  `QWEN_BLOCK_PROFILE=1` (per-segment forced submit sync, for diagnostics) measured the input segment
-  at 17.8→12.7 ms/layer (encode tax -0.16 s/step), full 40-step image 77.8→73.2 s (measured warm-GPU,
-  so the gain is a lower bound); the fused output is **bit-identical** to the three-GEMM version.
-  Measured gate+LN fusion is only ~0.2 ms/layer — the data does not support it, so it was not done;
-  the remaining CPU encode tax (~5 MPSGraph encodes per layer × ~2-3 ms) partially overlaps GPU
-  execution, and compressing it further requires whole-step GPU timeline capture — on hold.
+  `QWEN_BLOCK_PROFILE=1` (per-segment forced submit sync, diagnostics) measured the input segment at
+  17.8→12.7 ms/layer (encode tax −0.16 s/step), full 40-step image 77.8→73.2 s (measured with a warm
+  GPU, so the gain is a lower bound); the fused output is **bit-identical** to the three-GEMM version.
+  Measured gate+LN fusion is only ~0.2 ms/layer — the data does not support it, so it was not done.
+  **CPU encode-tax diagnosis (2026-11-04, `QWEN_STEP_TRACE=1` per-step phases + GPU busy delta +
+  `QWEN_ENCODE_DELAY_MS` per-layer artificial delay marginal-response experiment)**: of the ~1.42 s
+  wall time for one 1024² step, the GPU workload is ~1.38 s (block profile: mlp+gate ~23.3 ms/layer,
+  input ~8.8, attention ~7.6, to_out ~3.1), i.e. **~97% GPU utilization — the encode tax contributes
+  ~0 to wall time**; pure CPU encoding is only ~0.1-0.15 s/step (+20 ms/layer delay produces no
+  wall-clock response; at +100 ms the GPU finishes while the CPU is still encoding), and the bulk of
+  the ~0.65 s baseline forward wall time is the encoder being back-pressured by the command queue.
+  Whole-step MPSGraph graph capture has no headroom at GPU saturation, so **that track is closed**.
+  `QWEN_MLP_UNFUSED=1` A/B of splitting the fused MLP graph showed zero gain (bench_linear's
+  64 TFLOPS inflated by L2 weight reuse; the fused graph is already at the real GEMM ceiling).
+  Remaining headroom is ~5-8%: the production attention chain at 36.6 TFLOPS vs 47-54 in the
+  microbenchmark (tile tuning), and element-wise kernel bandwidth. The diagnostics are kept
+  (after the 2026-11-05 review, unified to "enabled by value, parsed once at DiT creation" — `0` /
+  `off` / `false` equal unset, and no `getenv` runs on the hot path when disabled):
+  `QWEN_STEP_TRACE`, `QWEN_ENCODE_DELAY_MS`, `QWEN_MLP_UNFUSED`, `QWEN_BLOCK_PROFILE`,
+  `QWEN_DIT_DUMP`, plus the production fallbacks `QWEN_NO_STEP_CACHE` / `QWEN_FLASH_ATTN` /
+  `QWEN_NO_PREFIX`.
 - ti2i cond KV cache (2026-10-30): the cond/text rows' inputs are invariant across sampling steps
   (embed fixed, modulation pinned to the t=0 slot, rope fixed), so the first step runs in full and
   writes each layer's K/V into buffers that persist across steps (`dit->cache_k/v`, +4.3 GB single
@@ -448,6 +471,8 @@ make dit-tests        # DiT: per-segment blocks + full 32-layer forward
 make text-tests       # text encoder: bit-exact tokenization + 36-layer hidden states
 make vae-tests        # VAE: ~50 segments, bit-exact / noise-band
 make pipeline-tests   # scheduler/RoPE/RNG components
+make prefix-kernel-test vae-conv-ci-tests
+make png-tests vision-tests imgproc-tests ti2ifixture-tests lora-tests
 ```
 
 - Fixtures for DiT / text encoder / VAE require a
@@ -464,17 +489,21 @@ make pipeline-tests   # scheduler/RoPE/RNG components
 
 ```
 qwen-metal/
-├── h3_gpu.{h,m}          # Metal runtime (kernel dispatch, MPSGraph, caches)
+├── h3_gpu.{h,m}          # Metal runtime (kernel dispatch, MPSGraph, shape caches)
 ├── h3_shaders.metal      # All Metal kernels (GEMM/attention/RoPE/conv/…)
-├── h3_weights.*          # safetensors streaming loader (shard index)
+├── h3_weights.*          # safetensors streaming loader (shard index, zero-copy mapping)
 ├── qwen_host.*           # Architecture constants and host math
+├── qwen_model.*          # Checkpoint scan and component configs (including scheduler)
+├── qwen_json.*           # Lightweight JSON parser (with recursion-depth limit)
 ├── qwen_text_encoder.*   # Qwen3-VL text tower (36 layers, mrope, pre-final-norm)
-├── qwen_dit.*            # 7B single-stream DiT (32 layers, block-causal attention)
-├── qwen_vae.*            # VAE decoder (Wan lineage; the image path is a pure 2D network)
+├── qwen_vision.*         # Vision tower (ti2i reference encoding; GPU bf16 / CPU fallback)
+├── qwen_imgproc.*        # Reference resize, patchify, VAE input construction
+├── qwen_dit.*            # 7B single-stream DiT (32 layers, block-causal attention, LoRA, cond KV cache)
+├── qwen_vae.*            # VAE encoder/decoder (Wan lineage; the image path is a pure 2D network)
 ├── qwen_pipeline.*       # Scheduler / RoPE tables / denoise loop / CFG / decode
-├── qwen_png.*            # Minimal PNG encoder
-├── main.c                # CLI
-└── tests/                # Per-segment equivalence tests and fixture generators
+├── qwen_png.*            # PNG encode/decode (CRC and size validation)
+├── main.c                # CLI / REPL / JSONL serve
+└── tests/                # Per-segment equivalence tests, microbenchmarks, fixture generators
 ```
 
 Precision notes (semantic details aligned with the official diffusers reference):
@@ -489,10 +518,26 @@ Precision notes (semantic details aligned with the official diffusers reference)
 
 ## Debug environment variables
 
+Diagnostic switches are parsed once when the DiT is created and are **enabled by
+value**: unset, empty, `0`, `off`, and `false` all mean disabled, and no `getenv`
+runs on the hot path when disabled. Production fallbacks and diagnostics:
+
 | Variable | Effect |
 |---|---|
-| `QWEN_TEXT_DUMP=<dir>` | Dump text-encoder intermediates segment by segment (equivalence debugging) |
-| `QWEN_VAE_DUMP=<dir>` | Dump VAE intermediates segment by segment |
+| `QWEN_FLASH_ATTN=1` | Fall back to the hand-written flash2 attention kernel (default: MPSGraph fused SDPA) |
+| `QWEN_NO_STEP_CACHE=1` | Disable the ti2i cond KV cache and recompute every step |
+| `QWEN_NO_PREFIX=1` | Force a single prefix kernel over all rows (diagnostic mode; automatically disables the cond KV cache) |
+| `QWEN_STEP_TRACE=1` | Per-step up/fwd/sub/read timings plus the h3 GPU busy delta |
+| `QWEN_ENCODE_DELAY_MS=N` | Artificial per-layer CPU-encode delay (0..999 ms, clamped; invalid values rejected) for encode-tax marginal experiments |
+| `QWEN_MLP_UNFUSED=1` | Split the fused MLP graph for A/B (applies to both the full pass and ti2i target-only) |
+| `QWEN_BLOCK_PROFILE=1` | Per-stage DiT block timings (input / attention / mlp+gate, …) |
+| `QWEN_DIT_DUMP=<dir>` | Dump DiT intermediate tensors (directory must exist) |
+| `QWEN_TEXT_DUMP=<dir>` / `QW_DUMP_POS=1` | Per-segment text-encoder dumps / position-id dump |
+| `QWEN_VAE_DUMP=<dir>` | Per-stage VAE activation dumps (GPU path auto submit/read) |
+| `QWEN_VISION_CPU=1` | Vision tower falls back to the CPU fp32 path (default: GPU bf16) |
+| `QWEN_SERVE_MEM=1` | Serve prints a live/footprint memory line per request on stderr |
+| `H3_ZERO_COPY_WEIGHTS=0` / `=transformer` | Disable zero-copy weight mapping / map only the DiT |
+| `H3_VAE_SCALAR_CONV=1` | Fall back to the old scalar VAE 3×3 conv kernel (default: 9-tap GEMM) |
 | `H3_DISABLE_MPS_LINEAR=1` | Disable the linear MPSGraph fast path (pure kernel path) |
 | `H3_NAX=0` | Disable M5 TensorOps |
 
@@ -501,7 +546,22 @@ Precision notes (semantic details aligned with the official diffusers reference)
 - ti2i's CFG keeps one cross-step K/V cache per branch (with cfg > 1, cond and neg each hold one,
   roughly doubling peak within a request; the cache has a single-request lifetime and is freed when
   the request ends)
-- Windows / Linux are not supported (deeply Metal-dependent)
+- The CLI does not validate `<imageN>` tags against the number of supplied reference images (the
+  official pipeline passes them through unchanged; the Web front-end does check). Out-of-range
+  indices are mostly ignored by the model
+- VAE decoding is not tiled: the whole image is decoded in one pass. With zero-copy weights, peak
+  is ~17 GB at 1024² and ~47 GB at the largest official 3264 × 2176 size; the **worst combination
+  (1536 × 2752 + ti2i with 3 images + LoRA) reaches ~50 GB footprint and ~68 GB instantaneous
+  tensor peak** — comfortable on 128 GB machines, tight on 64 GB machines (ordinary 1024² sessions
+  are fine)
+- MPS rows=1 GEMM has run-to-run 1-ulp nondeterminism: two generations with the same seed differ by
+  ~0.08/255 in pixel values (bf16 rounding order), which is not a regression; official comparisons
+  use noise-band gates
+- Whole-step MPSGraph graph capture was closed after the encode-tax diagnosis (~97% GPU utilization,
+  no headroom); the only remaining optimization headroom is ~5-8% in attention tile tuning and
+  element-wise kernel bandwidth
+- Windows / Linux are not supported (deeply Metal-dependent); this is not a git-tracked tree, and
+  the vendored `linenoise.c` carries 30 legacy compile warnings (own code compiles warning-free)
 
 ## Acknowledgments and license
 

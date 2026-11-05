@@ -125,7 +125,11 @@ static h3_gpu_tensor *load_w(h3_weight_store *store, h3_gpu *gpu,
     tensor = h3_weight_load_bf16(store, gpu, name, ndim, shape, error,
                                  error_size);
     if (!tensor) {
-        snprintf(error, error_size, "vae weight %s: %s", name, error);
+        /* `error` as both vsnprintf destination and %s source is UB and
+         * destroys the first-load diagnostic; copy it first. */
+        char previous[256];
+        snprintf(previous, sizeof(previous), "%s", error);
+        snprintf(error, error_size, "vae weight %s: %s", name, previous);
         return NULL;
     }
     size_t count = h3_gpu_tensor_elements(tensor);
@@ -232,22 +236,31 @@ qw_vae *qw_vae_create(h3_gpu *gpu, const char *model_dir,
     // by callers before decode.
     snprintf(path, sizeof(path), "%s/vae/config.json", model_dir);
     FILE *config_file = fopen(path, "rb");
-    if (config_file) {
-        fseek(config_file, 0, SEEK_END);
+    if (config_file && fseek(config_file, 0, SEEK_END) == 0) {
         long size = ftell(config_file);
-        fseek(config_file, 0, SEEK_SET);
-        char *text = size > 0 ? malloc((size_t)size + 1) : NULL;
-        if (text && fread(text, 1, (size_t)size, config_file) == (size_t)size) {
+        char *text = (size > 0 && fseek(config_file, 0, SEEK_SET) == 0)
+                         ? malloc((size_t)size + 1) : NULL;
+        if (text &&
+            fread(text, 1, (size_t)size, config_file) == (size_t)size &&
+            !memchr(text, 0, (size_t)size)) {
             text[size] = 0;
             qw_json *config = NULL;
             if (qw_json_parse(text, &config, error, error_size)) {
                 const qw_json *mean = qw_json_get(config, "latents_mean");
                 const qw_json *std = qw_json_get(config, "latents_std");
-                for (int c = 0; c < QWEN_VAE_Z; c++) {
-                    vae->latents_mean[c] =
-                        (float)qw_json_number(qw_json_at(mean, (size_t)c));
-                    vae->latents_std[c] =
-                        (float)qw_json_number(qw_json_at(std, (size_t)c));
+                /* Accept only the complete 64-entry pair: a short array
+                 * left the remaining channels at std=0, producing inf/NaN
+                 * latents while std[0] alone looked valid. */
+                if (qw_json_type(mean) == QWEN_JSON_ARRAY &&
+                    qw_json_type(std) == QWEN_JSON_ARRAY &&
+                    qw_json_count(mean) == QWEN_VAE_Z &&
+                    qw_json_count(std) == QWEN_VAE_Z) {
+                    for (int c = 0; c < QWEN_VAE_Z; c++) {
+                        vae->latents_mean[c] =
+                            (float)qw_json_number(qw_json_at(mean, (size_t)c));
+                        vae->latents_std[c] =
+                            (float)qw_json_number(qw_json_at(std, (size_t)c));
+                    }
                 }
                 qw_json_free(config);
             } else {
@@ -257,6 +270,8 @@ qw_vae *qw_vae_create(h3_gpu *gpu, const char *model_dir,
         } else {
             free(text);
         }
+        fclose(config_file);
+    } else if (config_file) {
         fclose(config_file);
     }
 
@@ -1085,15 +1100,17 @@ int qw_vae_encode(qw_vae *vae, const h3_gpu_tensor *input, uint32_t height,
     /* vae_pad_elems walks (height-1) below: a zero side would underflow
      * into a nonsense — possibly enormous — arena size before any kernel
      * guard could reject it. Decode validates the same way. */
-    if (!height || !width) {
-        snprintf(error, error_size, "vae encode: zero latent size");
+    if (!height || !width || height % 16 || width % 16 || height < 16 ||
+        width < 16) {
+        snprintf(error, error_size,
+                 "vae encode: size must be a multiple of 16 (>= 16)");
         return 0;
     }
     /* The packing stage divides by latents_std per channel: with stats
      * missing (create tolerates a broken config.json and leaves zeros)
      * that silently produced ±inf/NaN latents that propagated into the
      * DiT. The decode side checks the same getter convention. */
-    if (vae->latents_std[0] == 0.0f) {
+    if (!qw_vae_latents_std(vae)) {
         snprintf(error, error_size, "vae encode: latents stats missing");
         return 0;
     }
@@ -1252,5 +1269,10 @@ int qw_vae_encode(qw_vae *vae, const h3_gpu_tensor *input, uint32_t height,
 }
 
 const float *qw_vae_latents_std(const qw_vae *vae) {
-    return vae && vae->latents_std[0] != 0.0f ? vae->latents_std : NULL;
+    if (!vae) return NULL;
+    /* Every channel divides/multiplies by std; checking only channel 0
+     * let a truncated or corrupt config inject inf/NaN latents. */
+    for (int c = 0; c < QWEN_VAE_Z; c++)
+        if (!(vae->latents_std[c] > 0.0f)) return NULL;
+    return vae->latents_std;
 }

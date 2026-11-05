@@ -729,7 +729,7 @@ int qw_text_template_tokens_ti2i(qw_text *text, const char *prompt,
     return 1;
 }
 
-void qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
+int qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
                      uint32_t n_images, const uint32_t *grid_hw,
                      int32_t *pos_out) {
     /* 三行 [T, H, W]，每行 count 个。文本段三轴共用递增位置；image 段
@@ -742,6 +742,10 @@ void qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
             uint32_t gh = grid_hw[img * 2], gw = grid_hw[img * 2 + 1];
             size_t run_start = s;
             while (s < count && ids[s] == image_pad_id) s++;
+            /* The caller checks the global pad count, but a single run
+             * shorter than its grid would still write past the run (and
+             * past `count` for a trailing run). Validate each run. */
+            if (s - run_start != (size_t)gh * gw) return 0;
             for (uint32_t r = 0; r < gh; r++)
                 for (uint32_t c = 0; c < gw; c++) {
                     pos_out[(size_t)0 * count + run_start + r * gw + c] =
@@ -761,6 +765,7 @@ void qw_text_pos_ids(const uint32_t *ids, size_t count, uint32_t image_pad_id,
         current++;
         s++;
     }
+    return 1;
 }
 
 int qw_text_encode_ti2i(qw_text *text, const char *prompt, uint32_t n_images,
@@ -817,7 +822,13 @@ int qw_text_encode_ti2i(qw_text *text, const char *prompt, uint32_t n_images,
                          "ti2i: pad count %zu != slots %u", pads,
                          slots_total);
     }
-    qw_text_pos_ids(ids, seq, pad_id, n_images, grid_hw, pos);
+    if (!qw_text_pos_ids(ids, seq, pad_id, n_images, grid_hw, pos)) {
+        free(pos);
+        free(mask);
+        h3_tokenizer_ids_free(ids);
+        return set_error(error, error_size,
+                         "ti2i: image pad run length mismatch");
+    }
     if (getenv("QW_DUMP_POS")) {
         FILE *pf = fopen("/tmp/c_pos2.bin", "wb");
         if (pf) {
